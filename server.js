@@ -203,12 +203,9 @@ setInterval(() => {
 // Biến môi trường: TIKTOK_USERNAME (mặc định megan.3t), TIKTOK_ENABLED=0 để tắt.
 const TIKTOK_USERNAME = String(process.env.TIKTOK_USERNAME || 'megan.3t').replace(/^@/, '').trim() || 'megan.3t';
 const TIKTOK_ENABLED = process.env.TIKTOK_ENABLED !== '0';
+// tiktok-live-connector v2 là ESM-only ("type": "module") nên require() trong
+// CommonJS sẽ lỗi ERR_REQUIRE_ESM — phải dùng import() động (Node 18+ hỗ trợ).
 let TikTokLiveConnection = null;
-try {
-  TikTokLiveConnection = require('tiktok-live-connector').TikTokLiveConnection;
-} catch (e) {
-  console.log('[TikTok] Chua cai thu vien tiktok-live-connector — chay "npm install" truoc.');
-}
 
 function ttUser(data) {
   const u = (data && data.user) || {};
@@ -225,6 +222,7 @@ function ttRitual(user, k, extra) {
   broadcast({ t: 'act', id: 'streamer', k: k, d: d });
 }
 
+function startTikTokListener() {
 if (TIKTOK_ENABLED && TikTokLiveConnection) {
   const tt = new TikTokLiveConnection(TIKTOK_USERNAME, { enableExtendedGiftInfo: true });
   let ttRetry = null;
@@ -294,7 +292,18 @@ if (TIKTOK_ENABLED && TikTokLiveConnection) {
   ttConnect();
 } else {
   console.log('[TikTok] Tat listener (TIKTOK_ENABLED=0 hoac thieu thu vien).');
+  return;
 }
+}
+
+// Tải động thư viện ESM rồi mới khởi động listener
+import('tiktok-live-connector').then((mod) => {
+  TikTokLiveConnection = mod.TikTokLiveConnection;
+  startTikTokListener();
+}).catch((e) => {
+  console.log('[TikTok] Khong tai duoc thu vien tiktok-live-connector:', (e && e.message) || e);
+  startTikTokListener();
+});
 
 server.listen(PORT, () => {
   console.log('Chua Online server dang chay o cong ' + PORT + ' (toi da ' + MAX_PLAYERS + ' nguoi)');
