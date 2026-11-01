@@ -193,6 +193,109 @@ setInterval(() => {
   if (list.length) broadcast({ t: 'poss', list: list });
 }, POS_BROADCAST_MS);
 
+// ---------- TikTok LIVE: quà tặng / like / follow → nghi thức tự động ----------
+// Nghe livestream TikTok của chủ chùa (không cần đăng nhập, chỉ cần username).
+// Khi khán giả tặng quà → tự rung chuông + cộng công đức + hiện tên lên Bảng Vàng.
+// Like → gõ mõ. Follow → thắp hương chào mừng. Share → cộng công đức.
+// CHỈ hoạt động khi chủ chùa đang LIVE.
+// Lưu ý trung thực: tiktok-live-connector là reverse-engineering, TikTok đổi API
+// có thể làm nó ngừng chạy — webhook POST /ritual ở trên luôn là đường dự phòng.
+// Biến môi trường: TIKTOK_USERNAME (mặc định megan.3t), TIKTOK_ENABLED=0 để tắt.
+const TIKTOK_USERNAME = String(process.env.TIKTOK_USERNAME || 'megan.3t').replace(/^@/, '').trim() || 'megan.3t';
+const TIKTOK_ENABLED = process.env.TIKTOK_ENABLED !== '0';
+let TikTokLiveConnection = null;
+try {
+  TikTokLiveConnection = require('tiktok-live-connector').TikTokLiveConnection;
+} catch (e) {
+  console.log('[TikTok] Chua cai thu vien tiktok-live-connector — chay "npm install" truoc.');
+}
+
+function ttUser(data) {
+  const u = (data && data.user) || {};
+  return sanitizeName(u.nickname || u.uniqueId || data.nickname || data.uniqueId) || 'Khan gia TikTok';
+}
+function ttGift(data) {
+  const ext = data.extendedGiftInfo || {};
+  const giftName = data.giftName || ext.name || ('qua #' + (data.giftId || '?'));
+  const diamonds = Number(data.diamondCount || ext.diamondCost || 0) || 0;
+  return { giftName: String(giftName).slice(0, 40), diamonds: diamonds };
+}
+function ttRitual(user, k, extra) {
+  const d = Object.assign({}, extra, { user: user, from: 'tiktok' });
+  broadcast({ t: 'act', id: 'streamer', k: k, d: d });
+}
+
+if (TIKTOK_ENABLED && TikTokLiveConnection) {
+  const tt = new TikTokLiveConnection(TIKTOK_USERNAME, { enableExtendedGiftInfo: true });
+  let ttRetry = null;
+  let likeAcc = 0;
+
+  // Quà tặng → rung chuông + công đức theo giá trị quà
+  tt.on('gift', (data) => {
+    try {
+      if (!data.repeatEnd) return; // chỉ tính khi gửi xong chuỗi quà
+      const user = ttUser(data);
+      const g = ttGift(data);
+      const pts = Math.max(10, Math.min(200, g.diamonds || 10));
+      ttRitual(user, 'bell', { gift: g.giftName, diamonds: g.diamonds });
+      addMerit(user, pts);
+      console.log('[TikTok] ' + user + ' tang "' + g.giftName + '" (' + g.diamonds + ' kc) +' + pts + ' cong duc');
+    } catch (e) {}
+  });
+
+  // Like → cứ 200 like gõ mõ một tiếng
+  tt.on('like', (data) => {
+    try {
+      likeAcc += Number(data.count || 1) || 1;
+      if (likeAcc >= 200) {
+        likeAcc = 0;
+        const user = ttUser(data);
+        ttRitual(user, 'mok', { likes: 200 });
+        addMerit(user, 2);
+      }
+    } catch (e) {}
+  });
+
+  // Follow → thắp hương chào mừng + lên Bảng Vàng
+  tt.on('follow', (data) => {
+    try {
+      const user = ttUser(data);
+      ttRitual(user, 'incense', { note: 'chao mung' });
+      addMerit(user, 5);
+      console.log('[TikTok] ' + user + ' vua follow');
+    } catch (e) {}
+  });
+
+  // Share live → cộng công đức
+  tt.on('share', (data) => {
+    try { addMerit(ttUser(data), 10); } catch (e) {}
+  });
+
+  function ttConnect() {
+    tt.connect().then((state) => {
+      console.log('[TikTok] Da noi LIVE @' + TIKTOK_USERNAME + ' (room ' + state.roomId + ')');
+    }).catch((err) => {
+      const msg = err && err.message ? err.message : String(err);
+      console.log('[TikTok] Chua live hoac loi (' + msg.slice(0, 80) + ') — thu lai sau 5 phut.');
+      clearTimeout(ttRetry);
+      ttRetry = setTimeout(ttConnect, 5 * 60 * 1000);
+    });
+  }
+  tt.on('disconnected', () => {
+    console.log('[TikTok] Mat ket noi live — thu lai sau 1 phut.');
+    clearTimeout(ttRetry);
+    ttRetry = setTimeout(ttConnect, 60 * 1000);
+  });
+  tt.on('streamEnd', () => {
+    console.log('[TikTok] Live ket thuc — doi live moi (5 phut).');
+    clearTimeout(ttRetry);
+    ttRetry = setTimeout(ttConnect, 5 * 60 * 1000);
+  });
+  ttConnect();
+} else {
+  console.log('[TikTok] Tat listener (TIKTOK_ENABLED=0 hoac thieu thu vien).');
+}
+
 server.listen(PORT, () => {
   console.log('Chua Online server dang chay o cong ' + PORT + ' (toi da ' + MAX_PLAYERS + ' nguoi)');
 });
