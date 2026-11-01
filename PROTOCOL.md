@@ -10,7 +10,7 @@ Máy chủ: `server.js` (Node.js + thư viện `ws`). Mọi bản tin là JSON.
 | `pos` | `x,y,z` (số), `ry` (số, radian), `a` (string: `idle`/`walk`/`bow`/`sit`/`prostrate`) | Cập nhật vị trí + trạng thái, client gửi ~12 lần/giây khi di chuyển |
 | `act` | `k` (string ≤24 ký tự), `d` (object tùy ý) | Hành động một lần. Các `k` dùng trong game: `incense` (thắp hương), `bell` (thỉnh chuông), `mok` (gõ mõ), `prostrate` (đảnh lễ), `lantern` (thả hoa đăng), `wishcard` (treo thẻ ước nguyện), `beads` (lần tràng hạt), `chant` (tụng niệm), `sit`/`stand` (ngồi/đứng thiền) |
 | `ping` | — | Giữ kết nối |
-| `chat` | `text` (string, ≤200 ký tự) | Nhắn chat chung (quán trà đá): server lọc HTML, chống spam 1.5s/tin, lưu 30 tin gần nhất |
+| `chat` | `text` (string, ≤200 ký tự) | Nhắn chat chung (quán trà đá): server lọc HTML, lọc từ ngữ không phù hợp môi trường Phật pháp (thay bằng `***`, tin toàn từ cấm sẽ bị ẩn), chống spam 1.5s/tin, lưu 30 tin gần nhất |
 
 ## 2. Server → Client
 
@@ -44,7 +44,13 @@ Máy chủ: `server.js` (Node.js + thư viện `ws`). Mọi bản tin là JSON.
   lưu vào `data/merit.json`, broadcast `{t:'merit', board:[{name,points}]}` mỗi khi thay đổi;
   bản tin `welcome` cũng kèm `merit` hiện tại.
 
-## 5. Quy ước client (game Chùa Online)
+## 6. Bộ lọc môi trường Phật pháp
+
+Mọi nội dung do người dùng gửi (chat, lời nguyện cúng dường, góp ý) đều qua bộ lọc từ ngữ:
+nói bậy/thô tục, chửi bới/nhục mạ, đòi nợ → thay bằng `***` (kể cả viết lách kiểu `d.m`);
+tin nhắn chỉ còn `***` sẽ bị ẩn hẳn. Client nên lọc trước khi hiển thị để chắc chắn.
+
+## 7. Quy ước client (game Chùa Online)
 
 - Ô nhập **địa chỉ máy chủ** trong game (lưu `localStorage`, ví dụ `wss://chua-online-server.onrender.com`).
   Khi trống → chơi chế độ mô phỏng như cũ, không kết nối.

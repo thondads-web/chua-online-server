@@ -75,6 +75,33 @@ function addMerit(name, pts) {
   broadcastMerit();
 }
 
+// ---------- Lọc từ ngữ không phù hợp môi trường Phật pháp ----------
+// Chặn: nói bậy/thô tục, chửi bới/nhục mạ, đòi nợ — thay bằng ***
+const BANNED_SRC = [
+  // Nói bậy / thô tục
+  'địt', 'đ!t', 'lồn', 'cặc', 'đéo', 'cứt', 'đĩ',
+  'dm', 'đm', 'dmm', 'đmm', 'dcm', 'đcm', 'đcmn', 'vcl',
+  // Chửi bới / nhục mạ
+  'đồ chó', 'súc vật', 'óc chó', 'não chó', 'câm mồm',
+  'chết mẹ', 'chết cha', 'chết tiệt',
+  'đồ ngu', 'thằng ngu', 'con ngu',
+  // Đòi nợ / quấy rối nợ nần
+  'đòi nợ', 'siết nợ', 'xiết nợ', 'giang hồ',
+];
+function cleanText(s) {
+  let out = String(s || '');
+  for (const w of BANNED_SRC) {
+    const esc = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // cho phép viết tắt lách bằng dấu chấm/khoảng trắng (vd: d.m, d m)
+    const flex = esc.split('').join('[.\\s]*');
+    const re = new RegExp('(^|[^\\p{L}\\p{N}])' + flex + '([^\\p{L}\\p{N}]|$)', 'giu');
+    out = out.replace(re, (m, p1, p2) => p1 + '***' + p2);
+  }
+  return out;
+}
+function hasRealContent(s) {
+  return String(s || '').replace(/[\s*]/g, '').length > 0;
+}
 // ---------- Sổ cúng dường + Góp ý (dữ liệu thuộc về web mình) ----------
 const DONORS_FILE = path.join(DATA_DIR, 'donors.json');
 const FEEDBACK_FILE = path.join(DATA_DIR, 'feedback.json');
@@ -175,7 +202,7 @@ const server = http.createServer((req, res) => {
       let m; try { m = JSON.parse(body); } catch (e) { res.writeHead(400); res.end('bad json'); return; }
       const name = sanitizeName(m.name);
       const amount = Math.floor(Number(m.amount) || 0);
-      const wish = String(m.wish || '').trim().slice(0, 200);
+      const wish = cleanText(String(m.wish || '').trim().slice(0, 200));
       if (!name || !(amount > 0) || amount > 1000000000) { res.writeHead(400); res.end('bad data'); return; }
       const donors = readJson(DONORS_FILE, []);
       donors.push({ name: name, amount: amount, wish: wish, ts: Date.now() });
@@ -200,8 +227,8 @@ const server = http.createServer((req, res) => {
     readBody(req, (body) => {
       let m; try { m = JSON.parse(body); } catch (e) { res.writeHead(400); res.end('bad json'); return; }
       const name = sanitizeName(m.name) || 'Thí chủ ẩn danh';
-      const text = String(m.text || '').trim().slice(0, 500);
-      if (!text) { res.writeHead(400); res.end('bad data'); return; }
+      const text = cleanText(String(m.text || '').trim().slice(0, 500));
+      if (!hasRealContent(text)) { res.writeHead(400); res.end('bad data'); return; }
       const fb = readJson(FEEDBACK_FILE, []);
       fb.push({ name: name, text: text, ts: Date.now() });
       while (fb.length > 200) fb.shift();
@@ -263,7 +290,8 @@ wss.on('connection', (ws) => {
       const now = Date.now();
       if (now - (p.lastChat || 0) < CHAT_MIN_MS) return;
       let text = String(m.text || '').trim().slice(0, 200).replace(/[<>&]/g, '');
-      if (!text) return;
+      text = cleanText(text); // lọc từ ngữ không phù hợp môi trường Phật pháp
+      if (!hasRealContent(text)) return; // toàn từ cấm → bỏ tin
       p.lastChat = now;
       const msg = { t: 'chat', id: p.id, name: p.name, text: text, ts: now };
       chatHistory.push(msg);
