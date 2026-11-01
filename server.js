@@ -75,9 +75,42 @@ function addMerit(name, pts) {
   broadcastMerit();
 }
 
+// ---------- Sổ cúng dường + Góp ý (dữ liệu thuộc về web mình) ----------
+const DONORS_FILE = path.join(DATA_DIR, 'donors.json');
+const FEEDBACK_FILE = path.join(DATA_DIR, 'feedback.json');
+function readJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')) || fallback; } catch (e) { return fallback; }
+}
+function writeJson(file, obj) {
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(file, JSON.stringify(obj)); } catch (e) {}
+}
+// Chống spam theo IP
+const ipHits = new Map(); // ip -> {donate: ts, feedback: ts}
+function ipLimited(ip, kind, ms) {
+  const now = Date.now();
+  let rec = ipHits.get(ip);
+  if (!rec) { rec = {}; ipHits.set(ip, rec); }
+  if (now - (rec[kind] || 0) < ms) return true;
+  rec[kind] = now;
+  return false;
+}
+function clientIp(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  return (typeof fwd === 'string' ? fwd.split(',')[0] : '').trim() || req.socket.remoteAddress || 'unknown';
+}
+function readBody(req, cb) {
+  let body = '';
+  req.on('data', (c) => { body += c; if (body.length > 64 * 1024) req.destroy(); });
+  req.on('end', () => cb(body));
+}
+
 // ---------- Quản lý người chơi ----------
-const players = new Map(); // id -> { ws, name, x, y, z, ry, anim, lastSeen, hello, dirty }
+const players = new Map(); // id -> { ws, name, x, y, z, ry, anim, lastSeen, hello, dirty, lastChat }
 let nextId = 1;
+
+// ---------- Chat chung (quán trà đá / sân chùa) ----------
+const chatHistory = []; // {id, name, text, ts} — giữ 30 tin gần nhất
+const CHAT_MIN_MS = 1500; // chống spam: mỗi người cách nhau ít nhất 1.5 giây
 
 function sanitizeName(raw) {
   let s = String(raw == null ? '' : raw).trim().slice(0, 20);
@@ -127,6 +160,57 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+  // GET /donors — danh sách thí chủ cúng dường (mới nhất trước) + tổng tiền
+  if (req.method === 'GET' && req.url === '/donors') {
+    const donors = readJson(DONORS_FILE, []);
+    const total = donors.reduce((s, d) => s + (Number(d.amount) || 0), 0);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ donors: donors.slice(-20).reverse(), total: total, count: donors.length }));
+    return;
+  }
+  // POST /donate — ghi nhận cúng dường {name, amount, wish}
+  if (req.method === 'POST' && req.url === '/donate') {
+    if (ipLimited(clientIp(req), 'donate', 30000)) { res.writeHead(429); res.end('slow down'); return; }
+    readBody(req, (body) => {
+      let m; try { m = JSON.parse(body); } catch (e) { res.writeHead(400); res.end('bad json'); return; }
+      const name = sanitizeName(m.name);
+      const amount = Math.floor(Number(m.amount) || 0);
+      const wish = String(m.wish || '').trim().slice(0, 200);
+      if (!name || !(amount > 0) || amount > 1000000000) { res.writeHead(400); res.end('bad data'); return; }
+      const donors = readJson(DONORS_FILE, []);
+      donors.push({ name: name, amount: amount, wish: wish, ts: Date.now() });
+      while (donors.length > 200) donors.shift();
+      writeJson(DONORS_FILE, donors);
+      addMerit(name, Math.min(500, Math.floor(amount / 1000))); // 1.000đ = 1 điểm, tối đa 500
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    return;
+  }
+  // GET /feedback — đọc góp ý (mới nhất trước)
+  if (req.method === 'GET' && req.url === '/feedback') {
+    const fb = readJson(FEEDBACK_FILE, []);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(fb.slice(-20).reverse()));
+    return;
+  }
+  // POST /feedback — gửi góp ý {name, text}
+  if (req.method === 'POST' && req.url === '/feedback') {
+    if (ipLimited(clientIp(req), 'feedback', 60000)) { res.writeHead(429); res.end('slow down'); return; }
+    readBody(req, (body) => {
+      let m; try { m = JSON.parse(body); } catch (e) { res.writeHead(400); res.end('bad json'); return; }
+      const name = sanitizeName(m.name) || 'Thí chủ ẩn danh';
+      const text = String(m.text || '').trim().slice(0, 500);
+      if (!text) { res.writeHead(400); res.end('bad data'); return; }
+      const fb = readJson(FEEDBACK_FILE, []);
+      fb.push({ name: name, text: text, ts: Date.now() });
+      while (fb.length > 200) fb.shift();
+      writeJson(FEEDBACK_FILE, fb);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('Chua Online multiplayer server OK - ' + players.size + ' nguoi online');
 });
@@ -156,7 +240,7 @@ wss.on('connection', (ws) => {
       p.hello = true;
       const others = [];
       for (const q of players.values()) { if (q.id !== id && q.hello) others.push(publicState(q)); }
-      ws.send(JSON.stringify({ t: 'welcome', id: id, players: others, merit: boardTop(10) }));
+      ws.send(JSON.stringify({ t: 'welcome', id: id, players: others, merit: boardTop(10), chat: chatHistory.slice(-20) }));
       broadcast({ t: 'join', p: publicState(p) }, id);
     } else if (m.t === 'pos' && p.hello) {
       const nx = Number(m.x), ny = Number(m.y), nz = Number(m.z), nr = Number(m.ry);
@@ -173,6 +257,18 @@ wss.on('connection', (ws) => {
       d.user = p.name;
       broadcast({ t: 'act', id: id, k: k, d: d }, id);
       addMerit(p.name, MERIT_POINTS[k] || 0);
+    } else if (m.t === 'chat' && p.hello) {
+      // Chat chung: mọi người nói chuyện tự nhiên (quán trà đá).
+      // Chống spam: tối thiểu 1.5s/tin, tối đa 200 ký tự, lọc ký tự HTML.
+      const now = Date.now();
+      if (now - (p.lastChat || 0) < CHAT_MIN_MS) return;
+      let text = String(m.text || '').trim().slice(0, 200).replace(/[<>&]/g, '');
+      if (!text) return;
+      p.lastChat = now;
+      const msg = { t: 'chat', id: p.id, name: p.name, text: text, ts: now };
+      chatHistory.push(msg);
+      if (chatHistory.length > 30) chatHistory.shift();
+      broadcast(msg);
     } else if (m.t === 'ping') {
       ws.send(JSON.stringify({ t: 'pong' }));
     }
