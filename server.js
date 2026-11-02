@@ -238,6 +238,90 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+  // ---------- Thống kê truy cập (báo cáo mỗi sáng) ----------
+  const STATS_FILE = path.join(DATA_DIR, 'stats.json');
+  const STATS_TYPES = ['pv', 'dwell', 'feat'];
+  function statsDayKey(ts) {
+    const d = new Date(Number(ts) || Date.now());
+    const y = d.getFullYear();
+    const mo = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return y + '-' + mo + '-' + dd;
+  }
+  function validStatsStr(s) { return typeof s === 'string' && s.length > 0 && s.length <= 64; }
+  function pruneStats(stats) {
+    const keys = Object.keys(stats).sort(); // YYYY-MM-DD xếp theo thời gian
+    while (keys.length > 30) { delete stats[keys.shift()]; }
+  }
+  // POST /stats — nhận batch sự kiện analytics từ web (tối đa 100 events/request)
+  // Body: {events:[{t:"pv"|"dwell"|"feat", p:"home"|"boitoan", s:"ten-section",
+  //                 f:"ten-tinh-nang", d:so-giay, ts:epoch_ms}, ...]}
+  if (req.method === 'POST' && req.url === '/stats') {
+    if (ipLimited(clientIp(req), 'stats', 10000)) { res.writeHead(429); res.end('slow down'); return; }
+    readBody(req, (body) => {
+      let m; try { m = JSON.parse(body); } catch (e) { res.writeHead(400); res.end('bad json'); return; }
+      const events = m.events;
+      if (!Array.isArray(events) || events.length === 0 || events.length > 100) { res.writeHead(400); res.end('bad data'); return; }
+      const stats = readJson(STATS_FILE, {});
+      let accepted = 0;
+      for (const e of events) {
+        if (!e || typeof e !== 'object') continue;
+        if (!STATS_TYPES.includes(e.t)) continue;
+        if (!validStatsStr(e.p)) continue;
+        let dur = 0;
+        if (e.t === 'dwell') {
+          if (!validStatsStr(e.s)) continue;
+          dur = Number(e.d);
+          if (!Number.isFinite(dur) || dur < 0 || dur > 3600) continue;
+        }
+        if (e.t === 'feat') { if (!validStatsStr(e.f)) continue; }
+        const day = statsDayKey(e.ts);
+        if (!stats[day]) stats[day] = { pageviews: {}, dwell: {}, features: {} };
+        const rec = stats[day];
+        if (e.t === 'pv') rec.pageviews[e.p] = (rec.pageviews[e.p] || 0) + 1;
+        else if (e.t === 'dwell') { const k = e.p + ':' + e.s; rec.dwell[k] = (rec.dwell[k] || 0) + dur; }
+        else if (e.t === 'feat') rec.features[e.f] = (rec.features[e.f] || 0) + 1;
+        accepted++;
+      }
+      pruneStats(stats);
+      writeJson(STATS_FILE, stats);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, accepted: accepted }));
+    });
+    return;
+  }
+  // GET /stats/summary?days=7 — tổng hợp N ngày gần nhất
+  if (req.method === 'GET' && req.url.startsWith('/stats/summary')) {
+    let days = 7;
+    try {
+      const u = new URL(req.url, 'http://localhost');
+      const q = parseInt(u.searchParams.get('days'), 10);
+      if (Number.isFinite(q)) days = Math.max(1, Math.min(30, q));
+    } catch (e) {}
+    const stats = readJson(STATS_FILE, {});
+    const keys = Object.keys(stats).sort().slice(-days);
+    const pageviews = { home: 0, boitoan: 0 };
+    const dwellAgg = {}, featAgg = {};
+    let totalEvents = 0;
+    for (const k of keys) {
+      const rec = stats[k] || {};
+      for (const [p, n] of Object.entries(rec.pageviews || {})) {
+        if (p === 'home') pageviews.home += n;
+        else if (p === 'boitoan') pageviews.boitoan += n;
+        totalEvents += n;
+      }
+      for (const [s, sec] of Object.entries(rec.dwell || {})) dwellAgg[s] = (dwellAgg[s] || 0) + sec;
+      for (const [f, n] of Object.entries(rec.features || {})) { featAgg[f] = (featAgg[f] || 0) + n; totalEvents += n; }
+    }
+    const top = (obj, n) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, n);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      days: keys, pageviews: pageviews,
+      topDwell: top(dwellAgg, 10), topFeatures: top(featAgg, 10),
+      totalEvents: totalEvents,
+    }));
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('Chua Online multiplayer server OK - ' + players.size + ' nguoi online');
 });
