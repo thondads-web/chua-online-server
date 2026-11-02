@@ -6,7 +6,7 @@ Máy chủ: `server.js` (Node.js + thư viện `ws`). Mọi bản tin là JSON.
 
 | t | Trường | Ý nghĩa |
 |---|--------|---------|
-| `hello` | `name` (string, ≤20 ký tự) | Chào sân, đăng ký tên hiển thị |
+| `hello` | `name` (string, ≤20 ký tự), `level` (số 1–10, tùy chọn), `levelName` (string ≤20 ký tự, tùy chọn) | Chào sân, đăng ký tên hiển thị (+ cấp độ tu tập để hiện trên bảng tên) |
 | `pos` | `x,y,z` (số), `ry` (số, radian), `a` (string: `idle`/`walk`/`bow`/`sit`/`prostrate`) | Cập nhật vị trí + trạng thái, client gửi ~12 lần/giây khi di chuyển |
 | `act` | `k` (string ≤24 ký tự), `d` (object tùy ý) | Hành động một lần. Các `k` dùng trong game: `incense` (thắp hương), `bell` (thỉnh chuông), `mok` (gõ mõ), `prostrate` (đảnh lễ), `lantern` (thả hoa đăng), `wishcard` (treo thẻ ước nguyện), `beads` (lần tràng hạt), `chant` (tụng niệm), `sit`/`stand` (ngồi/đứng thiền) |
 | `ping` | — | Giữ kết nối |
@@ -16,11 +16,11 @@ Máy chủ: `server.js` (Node.js + thư viện `ws`). Mọi bản tin là JSON.
 
 | t | Trường | Ý nghĩa |
 |---|--------|---------|
-| `welcome` | `id`, `players[]` (mỗi phần tử `{id,name,x,y,z,ry,anim}`), `chat[]` (20 tin nhắn gần nhất `{id,name,text,ts}`) | Chào mừng + danh sách người đang có mặt + lịch sử chat |
+| `welcome` | `id`, `players[]` (mỗi phần tử `{id,name,x,y,z,ry,anim}` + `level`,`levelName` nếu có), `chat[]` (20 tin nhắn gần nhất `{id,name,text,ts}`) | Chào mừng + danh sách người đang có mặt + lịch sử chat |
 | `chat` | `id`, `name`, `text`, `ts` | Một người vừa nhắn chat chung — client hiển thị vào khung chat |
-| `join` | `p` `{id,name,x,y,z,ry,anim}` | Có người mới vào |
+| `join` | `p` `{id,name,x,y,z,ry,anim}` + `level`,`levelName` nếu có | Có người mới vào |
 | `leave` | `id` | Có người rời đi |
-| `poss` | `list[]` `{id,name,x,y,z,ry,anim}` | Gói vị trí gom 10 lần/giây — client nội suy mượt giữa các gói |
+| `poss` | `list[]` `{id,name,x,y,z,ry,anim}` + `level`,`levelName` nếu có | Gói vị trí gom 10 lần/giây — client nội suy mượt giữa các gói |
 | `act` | `id`, `k`, `d` | Một người chơi vừa làm hành động `k` — client tái hiện hoạt ảnh tại vị trí người đó |
 | `pong` | — | Trả lời `ping` |
 | `full` | — | Sân đã đủ `MAX_PLAYERS` người, client hiển thị thông báo rồi đóng kết nối |
