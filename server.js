@@ -132,7 +132,7 @@ function readBody(req, cb) {
 }
 
 // ---------- Quản lý người chơi ----------
-const players = new Map(); // id -> { ws, name, x, y, z, ry, anim, lastSeen, hello, dirty, lastChat }
+const players = new Map(); // id -> { ws, name, x, y, z, ry, anim, level, levelName, lastSeen, hello, dirty, lastChat }
 let nextId = 1;
 
 // ---------- Chat chung (quán trà đá / sân chùa) ----------
@@ -145,7 +145,9 @@ function sanitizeName(raw) {
   return s;
 }
 function publicState(p) {
-  return { id: p.id, name: p.name, x: p.x, y: p.y, z: p.z, ry: p.ry, anim: p.anim };
+  const o = { id: p.id, name: p.name, x: p.x, y: p.y, z: p.z, ry: p.ry, anim: p.anim };
+  if (p.level) { o.level = p.level; if (p.levelName) o.levelName = p.levelName; }
+  return o;
 }
 function broadcast(msg, exceptId) {
   const data = JSON.stringify(msg);
@@ -348,6 +350,11 @@ wss.on('connection', (ws) => {
     if (m.t === 'hello') {
       const name = sanitizeName(m.name);
       if (name) p.name = name;
+      /* Cấp độ tu tập (tùy chọn): client gửi kèm bản tin hello để bảng tên
+         người chơi khác hiện cấp. level 1–10, levelName ≤20 ký tự (đã lọc). */
+      const lv = Math.floor(Number(m.level));
+      p.level = (Number.isFinite(lv) && lv >= 1 && lv <= 10) ? lv : 0;
+      p.levelName = sanitizeName(m.levelName);
       p.hello = true;
       const others = [];
       for (const q of players.values()) { if (q.id !== id && q.hello) others.push(publicState(q)); }
