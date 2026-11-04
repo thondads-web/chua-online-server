@@ -1,0 +1,19 @@
+# Deps (Bonto chạy npm install khi deploy từ GitHub)
+node_modules/
+
+# Secrets — KHÔNG bao giờ commit
+.env
+.env.*
+*.pem
+*.key
+
+# Dữ liệu tài khoản/phiên/ví — tạo lúc runtime, không commit lên repo public
+data/users.json
+data/sessions.json
+data/reset_tokens.json
+data/ledger.json
+
+# Log + file tạm
+*.log
+*.tmp
+.DS_Store

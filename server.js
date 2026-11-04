@@ -19,6 +19,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
+const authRouter = require('./auth'); // Tài khoản + ví xu (mount /auth/* bên dưới)
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const MAX_PLAYERS = parseInt(process.env.MAX_PLAYERS || '200', 10);
@@ -159,6 +160,13 @@ function broadcast(msg, exceptId) {
 
 // ---------- HTTP: webhook nghi thức + xem bảng vàng ----------
 const server = http.createServer((req, res) => {
+  // /auth/* — tài khoản + ví xu (xử lý CORS + cookie trong auth.js)
+  if (req.url === '/auth' || req.url.startsWith('/auth/') || req.url.startsWith('/auth?')) {
+    authRouter.handleAuth(req, res).catch((e) => {
+      try { console.log('[auth] unhandled: ' + (e && e.message)); } catch (_) {}
+    });
+    return;
+  }
   // GET /merit — xem Bảng Vàng Công Đức (JSON)
   if (req.method === 'GET' && req.url === '/merit') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
