@@ -1,0 +1,1 @@
+{"ext":"js,json","ignore":["data/","node_modules/"],"watch":["server.js","auth.js","authStore.js","mailer.js","package.json"]}
