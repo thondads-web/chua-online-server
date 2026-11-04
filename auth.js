@@ -13,7 +13,7 @@ const mailer = require('./mailer');
 const WEB_ORIGIN = 'https://phatphaponline.pages.dev';
 const WEB_BASE = 'https://phatphaponline.pages.dev';
 const SESSION_DAYS = 30;
-const BCRYPT_COST = 12;
+const BCRYPT_COST = 10; // cost 10 (~0.3-0.5s): đủ an toàn, tránh proxy timeout khi hashSync cost 12 (~1.7s) gây 502 trên Bonto
 const RESET_TTL_MS = 60 * 60 * 1000; // 60 phút
 const LOCK_AFTER_FAILS = 5;
 const LOCK_MS = 15 * 60 * 1000; // 15 phút
@@ -230,7 +230,7 @@ async function doRegister(req, res, body) {
     return err(res, 409, 'ten_nhan_vat_ton_tai', 'Tên nhân vật này đã có người dùng.');
   }
 
-  const password_hash = bcrypt.hashSync(password, BCRYPT_COST);
+  const password_hash = await bcrypt.hash(password, BCRYPT_COST);
   const id = store.newUserId();
   const now = Date.now();
   users[id] = {
@@ -287,7 +287,7 @@ async function doLogin(req, res, body) {
   }
   let ok = false;
   if (user) {
-    try { ok = bcrypt.compareSync(password, user.password_hash); } catch (e) { ok = false; }
+    try { ok = await bcrypt.compare(password, user.password_hash); } catch (e) { ok = false; }
   }
   if (!user || !ok) {
     if (user) {
@@ -403,7 +403,7 @@ async function doReset(req, res, body) {
   const user = store.findById(users, r.user_id);
   if (!user) return err(res, 400, 'token_khong_hop_le', 'Link đặt lại không hợp lệ hoặc đã hết hạn.');
 
-  user.password_hash = bcrypt.hashSync(newPw, BCRYPT_COST);
+  user.password_hash = await bcrypt.hash(newPw, BCRYPT_COST);
   user.failed_attempts = 0;
   user.locked_until = 0;
   store.saveUsers(users);
