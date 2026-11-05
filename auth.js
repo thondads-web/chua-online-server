@@ -63,6 +63,14 @@ function sanitizeCharName(raw) {
   s = s.replace(/[̀-ͯ\u007F]/g, '');
   return s;
 }
+// Pháp danh: 2–20 ký tự, chỉ chữ (kể cả tiếng Việt có dấu), số, khoảng trắng, gạch ngang; không chứa link.
+function validPhapDanh(s) {
+  if (typeof s !== 'string') return false;
+  const t = s.trim();
+  if (t.length < 2 || t.length > 20) return false;
+  if (/https?:\/\/|www\./i.test(t)) return false;
+  return /^[\p{L}\p{N} \-]+$/u.test(t);
+}
 function setSessionCookie(res, token) {
   // SameSite=None để fetch cross-site (pages.dev → bonto.run) kèm cookie được.
   // (Design ghi Lax — Lax chặn cookie trên fetch cross-site nên phải dùng None.)
@@ -73,18 +81,24 @@ function setSessionCookie(res, token) {
 function clearSessionCookie(res) {
   res.setHeader('Set-Cookie', 'session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0');
 }
+function publicCharacter(c) {
+  c = c || {};
+  return {
+    name: c.name,
+    phapDanh: c.phapDanh || null,
+    avatar: c.avatar || 'unlock-1', // mặc định ảnh cấp 1 nếu chưa chọn
+    merit: c.merit || 0,
+    level: c.level || 1,
+    level_name: c.level_name || 'Phật tử mới',
+    updated_at: c.updated_at || 0,
+  };
+}
 function publicUser(u) {
   return {
     id: u.id,
     email: u.email || null,
     phone: u.phone || null,
-    character: {
-      name: u.character.name,
-      merit: u.character.merit || 0,
-      level: u.character.level || 1,
-      level_name: u.character.level_name || 'Phật tử mới',
-      updated_at: u.character.updated_at || 0,
-    },
+    character: publicCharacter(u.character),
     balance: u.balance || 0,
     created_at: u.created_at,
   };
@@ -240,6 +254,7 @@ async function doRegister(req, res, body) {
     password_hash: password_hash,
     character: {
       name: charName, merit: 0, level: 1, level_name: 'Phật tử mới',
+      phapDanh: null, avatar: 'unlock-1',
       updated_at: now, renamed_count: 0,
     },
     balance: 0,
@@ -435,44 +450,83 @@ function doCharacterGet(req, res) {
   const c = a.user.character;
   return json(res, 200, {
     ok: true,
-    character: {
-      name: c.name, merit: c.merit || 0, level: c.level || 1,
-      level_name: c.level_name || 'Phật tử mới', updated_at: c.updated_at || 0,
-    },
+    character: publicCharacter(c),
   });
 }
 
-// ---------- PATCH /auth/character (đổi tên nhân vật) ----------
+// ---------- PATCH /auth/character ----------
+// Cập nhật nhân vật: đổi tên (luồng cũ) + đặt pháp danh + chọn ảnh đại diện mở khóa theo cấp.
+// Body có thể chứa 1 hoặc nhiều trường: {name, phapDanh, avatar}.
+// - phapDanh: 2–20 ký tự, chỉ chữ/số/khoảng trắng/gạch ngang, không chứa link.
+// - avatar: id dạng unlock-1 … unlock-10; chỉ được chọn ảnh có cấp mở khóa ≤ cấp hiện tại,
+//   chọn ảnh chưa mở khóa → 403.
 function doCharacterPatch(req, res, body) {
   const a = getAuthUser(req);
   if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
-  const name = sanitizeCharName(body.name);
-  if (!name) {
-    return err(res, 400, 'ten_khong_hop_le', 'Tên nhân vật 1–20 ký tự.');
-  }
   const users = a.users;
   const user = a.user;
-  if (name === user.character.name) {
-    return json(res, 200, { ok: true, character: { name: name } });
+  const c = user.character;
+  const hasName = body.name !== undefined && body.name !== null && String(body.name).trim() !== '';
+  const hasPhapDanh = body.phapDanh !== undefined && body.phapDanh !== null && String(body.phapDanh).trim() !== '';
+  const hasAvatar = body.avatar !== undefined && body.avatar !== null && String(body.avatar).trim() !== '';
+  if (!hasName && !hasPhapDanh && !hasAvatar) {
+    return err(res, 400, 'khong_co_gi_thay_doi', 'Không có thông tin nào để cập nhật.');
   }
-  if (store.characterNameTaken(users, name, user.id)) {
-    return err(res, 409, 'ten_nhan_vat_ton_tai', 'Tên nhân vật này đã có người dùng.');
+  let changed = false;
+  // 1) Đổi tên nhân vật (luồng cũ: lần đầu miễn phí, từ lần 2 tốn xu — stub).
+  if (hasName) {
+    const name = sanitizeCharName(body.name);
+    if (!name) {
+      return err(res, 400, 'ten_khong_hop_le', 'Tên nhân vật 1–20 ký tự.');
+    }
+    if (name !== c.name) {
+      if (store.characterNameTaken(users, name, user.id)) {
+        return err(res, 409, 'ten_nhan_vat_ton_tai', 'Tên nhân vật này đã có người dùng.');
+      }
+      const renamed = c.renamed_count || 0;
+      if (renamed >= 1) {
+        return err(res, 402, 'doi_ten_ton_xu',
+          'Đổi tên lần tiếp theo tốn ' + RENAME_COST_XU + ' xu (chức năng đang phát triển).',
+          { cost_xu: RENAME_COST_XU });
+      }
+      c.name = name;
+      c.renamed_count = renamed + 1;
+      changed = true;
+    }
   }
-  // Lần đầu miễn phí; từ lần 2 tốn xu (stub — chưa trừ thật).
-  const renamed = user.character.renamed_count || 0;
-  if (renamed >= 1) {
-    return err(res, 402, 'doi_ten_ton_xu',
-      'Đổi tên lần tiếp theo tốn ' + RENAME_COST_XU + ' xu (chức năng đang phát triển).',
-      { cost_xu: RENAME_COST_XU });
+  // 2) Đặt pháp danh (hiển thị cùng bình luận thay cho tên nhân vật).
+  if (hasPhapDanh) {
+    const pd = String(body.phapDanh).trim();
+    if (!validPhapDanh(pd)) {
+      return err(res, 400, 'phap_danh_khong_hop_le', 'Pháp danh 2–20 ký tự, chỉ chữ, số, khoảng trắng và gạch ngang, không chứa link.');
+    }
+    c.phapDanh = pd;
+    changed = true;
   }
-  user.character.name = name;
-  user.character.renamed_count = renamed + 1;
-  user.character.updated_at = Date.now();
-  store.saveUsers(users);
-  return json(res, 200, { ok: true, character: { name: name } });
+  // 3) Chọn ảnh đại diện (chỉ ảnh đã mở khóa theo cấp).
+  if (hasAvatar) {
+    const av = String(body.avatar).trim();
+    const m = /^unlock-([1-9]|10)$/.exec(av);
+    if (!m) {
+      return err(res, 400, 'avatar_khong_hop_le', 'Ảnh đại diện không hợp lệ.');
+    }
+    const needLevel = parseInt(m[1], 10);
+    const curLevel = c.level || 1;
+    if (needLevel > curLevel) {
+      return err(res, 403, 'avatar_chua_mo_khoa',
+        'Ảnh này mở khóa ở cấp ' + needLevel + ', thí chủ đang ở cấp ' + curLevel + '.');
+    }
+    c.avatar = av;
+    changed = true;
+  }
+  if (changed) {
+    c.updated_at = Date.now();
+    store.saveUsers(users);
+  }
+  return json(res, 200, { ok: true, character: publicCharacter(c) });
 }
 
-module.exports = { handleAuth };
+module.exports = { handleAuth, getAuthUser };
 
 // ---------- GET /auth/admin/stats (thống kê cho cron báo cáo) ----------
 function maskEmail(e) {

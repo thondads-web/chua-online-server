@@ -20,6 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
 const authRouter = require('./auth'); // Tài khoản + ví xu (mount /auth/* bên dưới)
+const authStore = require('./authStore'); // Danh sách ảnh mở khóa theo cấp (GET /api/unlocks)
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const MAX_PLAYERS = parseInt(process.env.MAX_PLAYERS || '200', 10);
@@ -114,6 +115,8 @@ function writeJson(file, obj) {
 }
 // Chống spam theo IP
 const ipHits = new Map(); // ip -> {donate: ts, feedback: ts}
+// Chống spam bình luận: "tên\0articleId" -> [timestamp, ...] (tối đa 5 bình luận/giờ/cặp)
+const commentRate = new Map();
 function ipLimited(ip, kind, ms) {
   const now = Date.now();
   let rec = ipHits.get(ip);
@@ -247,6 +250,139 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ ok: true }));
     });
     return;
+  }
+  // ---------- Bình luận bài viết (hiện dưới bài dài / bài ngắn) ----------
+  // Lưu append-only: mỗi bình luận 1 dòng JSON trong data/comments.db
+  // (đuôi .db để nodemon của Bonto không restart khi ghi file — xem lỗi 502 ngày 05/11).
+  const COMMENTS_FILE = path.join(DATA_DIR, 'comments.db');
+  const COMMENT_MAX_PER_HOUR = 5; // tối đa 5 bình luận/giờ cho cùng 1 cặp (tên + bài)
+  const COMMENT_WINDOW_MS = 60 * 60 * 1000;
+  function commentsCorsHeaders() {
+    return {
+      'Access-Control-Allow-Origin': 'https://phatphaponline.pages.dev',
+      'Access-Control-Allow-Credentials': 'true',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Vary': 'Origin',
+    };
+  }
+  function commentsJson(res, status, obj) {
+    const h = Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, commentsCorsHeaders());
+    res.writeHead(status, h);
+    res.end(JSON.stringify(obj));
+  }
+  function validArticleId(s) {
+    return typeof s === 'string' && s.length > 0 && s.length <= 64 && /^[a-z0-9-]+$/.test(s);
+  }
+  // Rate limit: 5 bình luận/giờ cho cùng 1 khóa + bài viết.
+  // Tài khoản giới hạn theo user_id; khách vãng lai giới hạn theo IP
+  // (khách đều chung tên "Nhà sư vãng lai" nên không thể giới hạn theo tên —
+  //  giới hạn theo tên sẽ khiến 1 khách spam chặn hết khách khác trên cùng bài).
+  function commentLimited(key) {
+    const now = Date.now();
+    let arr = (commentRate.get(key) || []).filter((t) => now - t < COMMENT_WINDOW_MS);
+    if (arr.length >= COMMENT_MAX_PER_HOUR) { commentRate.set(key, arr); return true; }
+    arr.push(now);
+    commentRate.set(key, arr);
+    return false;
+  }
+  function readCommentsFile() {
+    try {
+      const raw = fs.readFileSync(COMMENTS_FILE, 'utf8');
+      const out = [];
+      for (const line of raw.split('\n')) {
+        if (!line.trim()) continue;
+        try { const c = JSON.parse(line); if (c && typeof c === 'object') out.push(c); } catch (e) {}
+      }
+      return out;
+    } catch (e) { return []; }
+  }
+  // Chuẩn hoá bình luận trả về: {id, articleId, name, avatar, isGuest, text, createdAt}.
+  // (Bình luận cũ chưa có avatar/isGuest thì mặc định theo dạng khách vãng lai.)
+  function publicComment(c) {
+    const isGuest = c.isGuest !== false;
+    return {
+      id: c.id, articleId: c.articleId,
+      name: c.name || 'Nhà sư vãng lai',
+      avatar: c.avatar || (isGuest ? '/anh-su/tieu-su-phu.jpg' : '/anh-mo-khoa/unlock-1.jpg'),
+      isGuest: isGuest, text: c.text, createdAt: c.createdAt,
+    };
+  }
+  let commentsPath = null;
+  try { commentsPath = new URL(req.url, 'http://localhost').pathname; } catch (e) {}
+  // GET /api/unlocks — danh sách 10 ảnh mở khóa theo cấp (không cần đăng nhập)
+  if (commentsPath === '/api/unlocks') {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, commentsCorsHeaders());
+      res.end();
+      return;
+    }
+    if (req.method === 'GET') {
+      commentsJson(res, 200, { ok: true, unlocks: authStore.AVATAR_UNLOCKS });
+      return;
+    }
+  }
+  if (commentsPath === '/api/comments') {
+    // Preflight CORS cho /api/comments
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, commentsCorsHeaders());
+      res.end();
+      return;
+    }
+    // GET /api/comments?article=<id> — tối đa 50 bình luận mới nhất của bài đó
+    if (req.method === 'GET') {
+      let article = '';
+      try { article = new URL(req.url, 'http://localhost').searchParams.get('article') || ''; } catch (e) {}
+      if (!validArticleId(article)) { commentsJson(res, 400, { ok: false, error: 'bad_article' }); return; }
+      const list = readCommentsFile().filter((c) => c.articleId === article).slice(-50).reverse().map(publicComment);
+      commentsJson(res, 200, { ok: true, comments: list });
+      return;
+    }
+    // POST /api/comments — gửi bình luận {articleId, text} (+ name: chỉ còn ý nghĩa tương thích cũ)
+    // - Có session hợp lệ → bình luận của TÀI KHOẢN: tên hiển thị = pháp danh (nếu đặt) hoặc tên nhân vật;
+    //   avatar = ảnh đã chọn (mặc định ảnh cấp 1); isGuest: false.
+    // - Không session → KHÁCH VÃNG LAI: vẫn cho bình luận, nhưng server ép tên "Nhà sư vãng lai"
+    //   (bỏ qua trường name client gửi) + avatar cố định tiểu sư phụ; isGuest: true.
+    if (req.method === 'POST') {
+      readBody(req, (body) => {
+        let m; try { m = JSON.parse(body); } catch (e) { commentsJson(res, 400, { ok: false, error: 'bad_json' }); return; }
+        const articleId = String((m && m.articleId) || '').trim();
+        const rawText = String((m && m.text) || '').trim();
+        if (!validArticleId(articleId)) { commentsJson(res, 400, { ok: false, error: 'bad_article' }); return; }
+        if (!rawText) { commentsJson(res, 400, { ok: false, error: 'bad_text' }); return; }
+        if (rawText.length > 500) { commentsJson(res, 400, { ok: false, error: 'text_too_long' }); return; }
+        if (/https?:\/\/|www\./i.test(rawText)) { commentsJson(res, 400, { ok: false, error: 'no_links' }); return; }
+        const text = cleanText(rawText); // lọc từ ngữ không phù hợp môi trường Phật pháp
+        if (!hasRealContent(text)) { commentsJson(res, 400, { ok: false, error: 'bad_text' }); return; }
+        // Xác định danh tính từ session cookie (nếu có).
+        const authUser = authRouter.getAuthUser(req);
+        let name, avatar, isGuest, rateKey;
+        if (authUser && authUser.user && authUser.user.character) {
+          const c = authUser.user.character;
+          name = (c.phapDanh && String(c.phapDanh).trim()) || c.name;
+          avatar = authStore.avatarImageForId(c.avatar);
+          isGuest = false;
+          rateKey = 'user:' + authUser.user.id + '\0' + articleId;
+        } else {
+          name = 'Nhà sư vãng lai';
+          avatar = '/anh-su/tieu-su-phu.jpg';
+          isGuest = true;
+          rateKey = 'guest:' + clientIp(req) + '\0' + articleId;
+        }
+        if (commentLimited(rateKey)) { commentsJson(res, 429, { ok: false, error: 'rate_limited' }); return; }
+        const comment = {
+          id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+          articleId: articleId, name: name, avatar: avatar, isGuest: isGuest,
+          text: text, createdAt: Date.now(),
+        };
+        try {
+          fs.mkdirSync(DATA_DIR, { recursive: true });
+          fs.appendFileSync(COMMENTS_FILE, JSON.stringify(comment) + '\n');
+        } catch (e) { commentsJson(res, 500, { ok: false, error: 'save_failed' }); return; }
+        commentsJson(res, 200, { ok: true, comment: publicComment(comment) });
+      });
+      return;
+    }
   }
   // ---------- Thống kê truy cập (báo cáo mỗi sáng) ----------
   const STATS_FILE = path.join(DATA_DIR, 'stats.db');

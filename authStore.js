@@ -135,6 +135,26 @@ function levelFromMerit(merit) {
   return { level: cur.level, level_name: cur.name, merit: merit };
 }
 
+// ---------- Ảnh đại diện mở khóa theo cấp ----------
+// Mỗi cấp bậc mở khóa 1 ảnh (vị thần tiên / nhà sư Việt Nam) làm ảnh đại diện.
+// Ảnh thật nằm ở /anh-mo-khoa/unlock-<n>.jpg trên web (tạo sau); đây chỉ là danh sách + đường dẫn.
+const AVATAR_UNLOCKS = [
+  { level: 1,  id: 'unlock-1',  name: 'Quan Âm Bồ Tát',   image: '/anh-mo-khoa/unlock-1.jpg' },
+  { level: 2,  id: 'unlock-2',  name: 'Phật Di Lặc',      image: '/anh-mo-khoa/unlock-2.jpg' },
+  { level: 3,  id: 'unlock-3',  name: 'Địa Tạng Bồ Tát',  image: '/anh-mo-khoa/unlock-3.jpg' },
+  { level: 4,  id: 'unlock-4',  name: 'Thánh Gióng',      image: '/anh-mo-khoa/unlock-4.jpg' },
+  { level: 5,  id: 'unlock-5',  name: 'Chử Đồng Tử',      image: '/anh-mo-khoa/unlock-5.jpg' },
+  { level: 6,  id: 'unlock-6',  name: 'Liễu Hạnh',        image: '/anh-mo-khoa/unlock-6.jpg' },
+  { level: 7,  id: 'unlock-7',  name: 'Trần Nhân Tông',   image: '/anh-mo-khoa/unlock-7.jpg' },
+  { level: 8,  id: 'unlock-8',  name: 'Từ Đạo Hạnh',      image: '/anh-mo-khoa/unlock-8.jpg' },
+  { level: 9,  id: 'unlock-9',  name: 'Không Lộ',         image: '/anh-mo-khoa/unlock-9.jpg' },
+  { level: 10, id: 'unlock-10', name: 'Phật A Di Đà',     image: '/anh-mo-khoa/unlock-10.jpg' },
+];
+function avatarImageForId(avatarId) {
+  const u = AVATAR_UNLOCKS.find((x) => x.id === avatarId);
+  return u ? u.image : AVATAR_UNLOCKS[0].image; // mặc định ảnh cấp 1
+}
+
 // Tên nhân vật mặc định "Phật tử ####" — số ngẫu nhiên, không trùng.
 function randomCharacterName(users) {
   for (let i = 0; i < 50; i++) {
@@ -185,5 +205,6 @@ module.exports = {
   loadResets, saveResets,
   loadLedger, appendLedger, ledgerForUser, addBalance,
   MERIT_LEVELS, levelFromMerit, syncMeritFromGame,
+  AVATAR_UNLOCKS, avatarImageForId,
   validEmail, normalizePhone, newUserId,
 };
