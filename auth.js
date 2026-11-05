@@ -198,6 +198,7 @@ async function handleAuth(req, res) {
     if (route === '/wallet' && req.method === 'GET') return doWallet(req, res);
     if (route === '/character' && req.method === 'GET') return doCharacterGet(req, res);
     if (route === '/character' && req.method === 'PATCH') return doCharacterPatch(req, res, body);
+    if (route === '/earn' && req.method === 'POST') return await doEarn(req, res, body);
     if (route === '/admin/stats' && req.method === 'GET') return doAdminStats(req, res);
   } catch (e) {
     console.log('[auth] lỗi: ' + (e && e.message));
@@ -527,6 +528,61 @@ function doCharacterPatch(req, res, body) {
 }
 
 module.exports = { handleAuth, getAuthUser };
+
+// ---------- POST /auth/earn — cộng kinh nghiệm (công đức) khi dùng công cụ ----------
+// Mỗi lần tài khoản đã đăng nhập dùng 1 công cụ (gieo quẻ, đặt tên, xem lá số...)
+// thì được +XP_PER_USE công đức, lên cấp nhân vật theo bảng MERIT_LEVELS.
+// Chống cày điểm: 30 giây mới được cộng 1 lần + tối đa 50 lần/giờ/tài khoản.
+// Trả về merit/level hiện tại + leveled_up để web hiện bảng thông báo 3 giây.
+const XP_PER_USE = 10;
+const XP_COOLDOWN_MS = 30 * 1000;
+const XP_HOURLY_CAP = 50;
+async function doEarn(req, res, body) {
+  const a = getAuthUser(req);
+  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  const service = String(body.service || '').trim().slice(0, 50);
+  if (!/^[a-z0-9_-]{1,50}$/i.test(service)) {
+    return err(res, 400, 'dich_vu_khong_hop_le', 'Tên dịch vụ chưa đúng.');
+  }
+  const users = a.users;
+  const user = a.user;
+  const now = Date.now();
+  // Chống spam: 30 giây mới cộng 1 lần (theo tài khoản).
+  const lastAt = Math.floor(Number(user.xp_last_at) || 0);
+  if (now - lastAt < XP_COOLDOWN_MS) {
+    return err(res, 429, 'cong_diem_qua_nhanh',
+      'Thí chủ thao tác quá nhanh, thử lại sau ' + Math.ceil((XP_COOLDOWN_MS - (now - lastAt)) / 1000) + ' giây.',
+      { retry_after_giay: Math.ceil((XP_COOLDOWN_MS - (now - lastAt)) / 1000) });
+  }
+  // Chống cày: tối đa 50 lần/giờ/tài khoản.
+  const rlS = rateLimited('earn:user:' + user.id, XP_HOURLY_CAP, 3600 * 1000);
+  if (rlS) {
+    res.setHeader('Retry-After', rlS);
+    return err(res, 429, 'qua_nhieu_yeu_cau', 'Thí chủ đã nhận đủ điểm trong giờ này, thử lại sau.');
+  }
+  const c = user.character;
+  const prevLevel = c.level || 1;
+  const prevMerit = Math.max(0, Math.floor(Number(c.merit) || 0));
+  const merit = prevMerit + XP_PER_USE;
+  const lv = store.levelFromMerit(merit);
+  c.merit = merit;
+  c.level = lv.level;
+  c.level_name = lv.level_name;
+  c.updated_at = now;
+  user.xp_last_at = now;
+  store.saveUsers(users);
+  return json(res, 200, {
+    ok: true,
+    xp_gained: XP_PER_USE,
+    service: service,
+    merit: merit,
+    level: lv.level,
+    level_name: lv.level_name,
+    prev_level: prevLevel,
+    leveled_up: lv.level > prevLevel,
+    character: publicCharacter(c),
+  });
+}
 
 // ---------- GET /auth/admin/stats (thống kê cho cron báo cáo) ----------
 function maskEmail(e) {
