@@ -259,13 +259,36 @@ const server = http.createServer((req, res) => {
     return y + '-' + mo + '-' + dd;
   }
   function validStatsStr(s) { return typeof s === 'string' && s.length > 0 && s.length <= 64; }
+  // Attribution nguồn traffic (chỉ lưu trên event pv — xem POST /stats bên dưới):
+  // src = giá trị ?src= trên URL; ref = hostname của document.referrer.
+  // Hợp lệ: lowercase, src chỉ [a-z0-9-], ref chỉ hostname [a-z0-9.-], <=64 ký tự.
+  // Sai format -> bỏ qua field nhưng vẫn chấp nhận event (đếm vào nguồn "direct").
+  // Không lưu IP, full URL, user agent.
+  function validSrc(s) {
+    if (typeof s !== 'string') return null;
+    var v = s.toLowerCase();
+    if (v.length === 0 || v.length > 64) return null;
+    if (!/^[a-z0-9-]+$/.test(v)) return null;
+    return v;
+  }
+  function validRef(s) {
+    if (typeof s !== 'string') return null;
+    var v = s.toLowerCase();
+    if (v.length === 0 || v.length > 64) return null;
+    if (!/^[a-z0-9.-]+$/.test(v)) return null;
+    return v;
+  }
   function pruneStats(stats) {
     const keys = Object.keys(stats).sort(); // YYYY-MM-DD xếp theo thời gian
     while (keys.length > 30) { delete stats[keys.shift()]; }
   }
   // POST /stats — nhận batch sự kiện analytics từ web (tối đa 100 events/request)
   // Body: {events:[{t:"pv"|"dwell"|"feat", p:"home"|"boitoan", s:"ten-section",
-  //                 f:"ten-tinh-nang", d:so-giay, ts:epoch_ms}, ...]}
+  //                 f:"ten-tinh-nang", d:so-giay, ts:epoch_ms,
+  //                 src:"?src= trên URL (chỉ event pv)", ref:"hostname của referrer (chỉ event pv)"}, ...]}
+  // Attribution: src hợp lệ = lowercase [a-z0-9-], <=64 ký tự; ref hợp lệ = hostname
+  // lowercase [a-z0-9.-], <=64 ký tự. Sai format -> bỏ qua field, event vẫn được
+  // chấp nhận và đếm vào nguồn "direct". Không lưu IP, full URL, user agent.
   if (req.method === 'POST' && req.url === '/stats') {
     if (ipLimited(clientIp(req), 'stats', 10000)) { res.writeHead(429); res.end('slow down'); return; }
     readBody(req, (body) => {
@@ -286,9 +309,19 @@ const server = http.createServer((req, res) => {
         }
         if (e.t === 'feat') { if (!validStatsStr(e.f)) continue; }
         const day = statsDayKey(e.ts);
-        if (!stats[day]) stats[day] = { pageviews: {}, dwell: {}, features: {} };
+        if (!stats[day]) stats[day] = { pageviews: {}, dwell: {}, features: {}, sources: {}, refs: {} };
         const rec = stats[day];
-        if (e.t === 'pv') rec.pageviews[e.p] = (rec.pageviews[e.p] || 0) + 1;
+        if (e.t === 'pv') {
+          rec.pageviews[e.p] = (rec.pageviews[e.p] || 0) + 1;
+          var srcKey = validSrc(e.src) || 'direct';
+          if (!rec.sources) rec.sources = {};
+          rec.sources[srcKey] = (rec.sources[srcKey] || 0) + 1;
+          var refKey = validRef(e.ref);
+          if (refKey) {
+            if (!rec.refs) rec.refs = {};
+            rec.refs[refKey] = (rec.refs[refKey] || 0) + 1;
+          }
+        }
         else if (e.t === 'dwell') { const k = e.p + ':' + e.s; rec.dwell[k] = (rec.dwell[k] || 0) + dur; }
         else if (e.t === 'feat') rec.features[e.f] = (rec.features[e.f] || 0) + 1;
         accepted++;
@@ -311,7 +344,7 @@ const server = http.createServer((req, res) => {
     const stats = readJson(STATS_FILE, {});
     const keys = Object.keys(stats).sort().slice(-days);
     const pageviews = { home: 0, boitoan: 0 };
-    const dwellAgg = {}, featAgg = {};
+    const dwellAgg = {}, featAgg = {}, srcAgg = {}, refAgg = {};
     let totalEvents = 0;
     for (const k of keys) {
       const rec = stats[k] || {};
@@ -322,12 +355,15 @@ const server = http.createServer((req, res) => {
       }
       for (const [s, sec] of Object.entries(rec.dwell || {})) dwellAgg[s] = (dwellAgg[s] || 0) + sec;
       for (const [f, n] of Object.entries(rec.features || {})) { featAgg[f] = (featAgg[f] || 0) + n; totalEvents += n; }
+      for (const [s, n] of Object.entries(rec.sources || {})) srcAgg[s] = (srcAgg[s] || 0) + n;
+      for (const [r, n] of Object.entries(rec.refs || {})) refAgg[r] = (refAgg[r] || 0) + n;
     }
     const top = (obj, n) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, n);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
       days: keys, pageviews: pageviews,
       topDwell: top(dwellAgg, 10), topFeatures: top(featAgg, 10),
+      topSources: top(srcAgg, 10), topRefs: top(refAgg, 10),
       totalEvents: totalEvents,
     }));
     return;
