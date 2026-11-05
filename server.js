@@ -1,7 +1,7 @@
 // ============================================================
 // Chùa Online — Máy chủ game nhiều người chơi (multiplayer)
 // + Webhook nghi thức cho livestream (TikFinity / Streamer.bot)
-// + Bảng Vàng Công Đức (lưu vào data/merit.json)
+// + Bảng Vàng Công Đức (lưu vào data/merit.db — đuôi .db để nodemon của Bonto không restart khi ghi file)
 //
 // Chạy bằng Node.js + WebSocket (thư viện "ws"). Không cần DB.
 //
@@ -36,7 +36,7 @@ const MERIT_POINTS = {
 
 // ---------- Bảng Vàng Công Đức (lưu file) ----------
 const DATA_DIR = path.join(__dirname, 'data');
-const MERIT_FILE = path.join(DATA_DIR, 'merit.json');
+const MERIT_FILE = path.join(DATA_DIR, 'merit.db');
 let merit = {};
 try {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -104,8 +104,8 @@ function hasRealContent(s) {
   return String(s || '').replace(/[\s*]/g, '').length > 0;
 }
 // ---------- Sổ cúng dường + Góp ý (dữ liệu thuộc về web mình) ----------
-const DONORS_FILE = path.join(DATA_DIR, 'donors.json');
-const FEEDBACK_FILE = path.join(DATA_DIR, 'feedback.json');
+const DONORS_FILE = path.join(DATA_DIR, 'donors.db');
+const FEEDBACK_FILE = path.join(DATA_DIR, 'feedback.db');
 function readJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')) || fallback; } catch (e) { return fallback; }
 }
@@ -249,7 +249,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   // ---------- Thống kê truy cập (báo cáo mỗi sáng) ----------
-  const STATS_FILE = path.join(DATA_DIR, 'stats.json');
+  const STATS_FILE = path.join(DATA_DIR, 'stats.db');
   const STATS_TYPES = ['pv', 'dwell', 'feat'];
   function statsDayKey(ts) {
     const d = new Date(Number(ts) || Date.now());

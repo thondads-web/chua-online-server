@@ -10,10 +10,10 @@ const path = require('path');
 const crypto = require('crypto');
 
 const DATA_DIR = path.join(__dirname, 'data');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
-const RESETS_FILE = path.join(DATA_DIR, 'reset_tokens.json');
-const LEDGER_FILE = path.join(DATA_DIR, 'ledger.json');
+const USERS_FILE = path.join(DATA_DIR, 'users.db');
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.db');
+const RESETS_FILE = path.join(DATA_DIR, 'resets.db');
+const LEDGER_FILE = path.join(DATA_DIR, 'ledger.db');
 
 function ensureDir() {
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
@@ -144,11 +144,11 @@ function randomCharacterName(users) {
   return 'Phật tử ' + Date.now().toString().slice(-4);
 }
 
-// Đồng bộ merit từ game (data/merit.json, key = tên nhân vật) vào character.merit.
+// Đồng bộ merit từ game (data/merit.db, key = tên nhân vật) vào character.merit.
 // Không bao giờ giảm (dùng max) để đổi tên không mất công đức.
 function syncMeritFromGame(user) {
   if (!user || !user.character) return user;
-  const gameMerit = readJson(path.join(DATA_DIR, 'merit.json'), {});
+  const gameMerit = readJson(path.join(DATA_DIR, 'merit.db'), {});
   const gm = Math.floor(Number(gameMerit[user.character.name]) || 0);
   if (gm > (user.character.merit || 0)) {
     user.character.merit = gm;
