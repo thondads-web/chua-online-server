@@ -18,6 +18,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 const authRouter = require('./auth'); // Tài khoản + ví xu (mount /auth/* bên dưới)
 const authStore = require('./authStore'); // Danh sách ảnh mở khóa theo cấp (GET /api/unlocks)
@@ -387,12 +388,17 @@ const server = http.createServer((req, res) => {
   // ---------- Thống kê truy cập (báo cáo mỗi sáng) ----------
   const STATS_FILE = path.join(DATA_DIR, 'stats.db');
   const STATS_TYPES = ['pv', 'dwell', 'feat'];
+  // Ngày theo giờ Việt Nam (Asia/Saigon) — để thống kê theo ngày khớp với
+  // ngày người dùng ở VN xem web (server Bonto chạy giờ UTC, lệch 7 tiếng).
+  const SG_DAY_FMT = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Ho_Chi_Minh', year: 'numeric', month: '2-digit', day: '2-digit' });
   function statsDayKey(ts) {
-    const d = new Date(Number(ts) || Date.now());
-    const y = d.getFullYear();
-    const mo = String(d.getMonth() + 1).padStart(2, '0');
-    const dd = String(d.getDate()).padStart(2, '0');
-    return y + '-' + mo + '-' + dd;
+    try { return SG_DAY_FMT.format(new Date(Number(ts) || Date.now())); } catch (e) {
+      const d = new Date(Number(ts) || Date.now());
+      const y = d.getUTCFullYear();
+      const mo = String(d.getUTCMonth() + 1).padStart(2, '0');
+      const dd = String(d.getUTCDate()).padStart(2, '0');
+      return y + '-' + mo + '-' + dd;
+    }
   }
   function validStatsStr(s) { return typeof s === 'string' && s.length > 0 && s.length <= 64; }
   // Attribution nguồn traffic (chỉ lưu trên event pv — xem POST /stats bên dưới):
@@ -413,6 +419,24 @@ const server = http.createServer((req, res) => {
     if (v.length === 0 || v.length > 64) return null;
     if (!/^[a-z0-9.-]+$/.test(v)) return null;
     return v;
+  }
+  // Suy ra nguồn traffic khi event pv không có ?src= hợp lệ:
+  // ref là Google → 'seo'; Facebook → 'facebook'; TikTok → 'tiktok';
+  // YouTube → 'youtube'; Zalo → 'zalo'; còn lại → 'direct'.
+  // (Trước đây mọi lượt không có src đều đếm vào 'direct', kể cả lượt từ
+  // Google/Facebook — làm sai lệch topSources. Chỉ áp dụng cho event mới;
+  // dữ liệu ngày cũ giữ nguyên.)
+  function deriveSource(src, ref) {
+    var s = validSrc(src);
+    if (s) return s;
+    var r = validRef(ref);
+    if (!r) return 'direct';
+    if (/(^|\.)google\.[a-z]{2,}(\.[a-z]{2,})?$/.test(r)) return 'seo';
+    if (r.indexOf('facebook.com') !== -1 || r === 'fb.com' || r.endsWith('.fb.com')) return 'facebook';
+    if (r.indexOf('tiktok.com') !== -1) return 'tiktok';
+    if (r.indexOf('youtube.com') !== -1 || r === 'youtu.be' || r.endsWith('.youtu.be')) return 'youtube';
+    if (r.indexOf('zalo') !== -1) return 'zalo';
+    return 'direct';
   }
   function pruneStats(stats) {
     const keys = Object.keys(stats).sort(); // YYYY-MM-DD xếp theo thời gian
@@ -449,7 +473,7 @@ const server = http.createServer((req, res) => {
         const rec = stats[day];
         if (e.t === 'pv') {
           rec.pageviews[e.p] = (rec.pageviews[e.p] || 0) + 1;
-          var srcKey = validSrc(e.src) || 'direct';
+          var srcKey = deriveSource(e.src, e.ref);
           if (!rec.sources) rec.sources = {};
           rec.sources[srcKey] = (rec.sources[srcKey] || 0) + 1;
           var refKey = validRef(e.ref);
@@ -502,6 +526,91 @@ const server = http.createServer((req, res) => {
       topSources: top(srcAgg, 10), topRefs: top(refAgg, 10),
       totalEvents: totalEvents,
     }));
+    return;
+  }
+  // ---------- GET /stats/daily?days=30 — thống kê THEO NGÀY + THEO NGUỒN ----------
+  // Dùng cho trang admin xem traffic (admin-stats.html) và cron báo cáo sáng.
+  // Yêu cầu header x-admin-token = ADMIN_STATS_TOKEN (như /auth/admin/stats).
+  // Trả: rows[] mỗi ngày {day, total, pages, groups, sources, nhom, moi, refs,
+  // topFeatures, dwellSec} + totals (gộp cả kỳ). Chỉ số lượng, KHÔNG dữ liệu
+  // cá nhân (không email/SĐT/IP). CORS: chỉ cho phatphaponline.pages.dev đọc.
+  function statsDailyCorsHeaders() {
+    return {
+      'Access-Control-Allow-Origin': 'https://phatphaponline.pages.dev',
+      'Access-Control-Allow-Credentials': 'true',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Token',
+      'Vary': 'Origin',
+    };
+  }
+  function statsDailyJson(res, status, obj) {
+    const h = Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, statsDailyCorsHeaders());
+    res.writeHead(status, h);
+    res.end(JSON.stringify(obj));
+  }
+  function statsAdminTokenOk(req) {
+    const expected = process.env.ADMIN_STATS_TOKEN || '';
+    if (!expected) return 'missing';
+    const got = String(req.headers['x-admin-token'] || '');
+    const a = Buffer.from(got, 'utf8'), b = Buffer.from(expected, 'utf8');
+    if (a.length !== b.length) return 'wrong';
+    try { return crypto.timingSafeEqual(a, b) ? 'ok' : 'wrong'; } catch (e) { return 'wrong'; }
+  }
+  // Gộp nguồn thô thành nhóm hiển thị: nhom-* → nhom, moi-* → moi, còn lại giữ key.
+  function groupSources(sources) {
+    const groups = { direct: 0, video: 0, cmt: 0, nhom: 0, moi: 0, seo: 0, facebook: 0, tiktok: 0, youtube: 0, zalo: 0, khac: 0 };
+    const nhom = {}, moi = {};
+    for (const [k, n] of Object.entries(sources || {})) {
+      const v = Number(n) || 0;
+      if (k.indexOf('nhom-') === 0) { groups.nhom += v; nhom[k] = v; }
+      else if (k.indexOf('moi-') === 0) { groups.moi += v; moi[k] = v; }
+      else if (Object.prototype.hasOwnProperty.call(groups, k)) groups[k] += v;
+      else groups.khac += v;
+    }
+    return { groups: groups, nhom: nhom, moi: moi };
+  }
+  if (req.method === 'OPTIONS' && req.url.startsWith('/stats/daily')) {
+    res.writeHead(204, statsDailyCorsHeaders());
+    res.end();
+    return;
+  }
+  if (req.method === 'GET' && req.url.startsWith('/stats/daily')) {
+    const chk = statsAdminTokenOk(req);
+    if (chk === 'missing') { statsDailyJson(res, 503, { ok: false, error: 'chua_cau_hinh' }); return; }
+    if (chk !== 'ok') { statsDailyJson(res, 401, { ok: false, error: 'khong_co_quyen' }); return; }
+    let days = 30;
+    try {
+      const u = new URL(req.url, 'http://localhost');
+      const q = parseInt(u.searchParams.get('days'), 10);
+      if (Number.isFinite(q)) days = Math.max(1, Math.min(30, q));
+    } catch (e) {}
+    const stats = readJson(STATS_FILE, {});
+    const keys = Object.keys(stats).sort().slice(-days);
+    const top = (obj, n) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, n);
+    const rows = [];
+    const totals = { total: 0, pages: {}, groups: { direct: 0, video: 0, cmt: 0, nhom: 0, moi: 0, seo: 0, facebook: 0, tiktok: 0, youtube: 0, zalo: 0, khac: 0 }, refs: {} };
+    for (const k of keys) {
+      const rec = stats[k] || {};
+      let total = 0;
+      const pages = {};
+      for (const [p, n] of Object.entries(rec.pageviews || {})) { pages[p] = n; total += n; totals.pages[p] = (totals.pages[p] || 0) + n; }
+      const g = groupSources(rec.sources || {});
+      for (const [gk, gv] of Object.entries(g.groups)) totals.groups[gk] += gv;
+      const refs = {};
+      for (const [r, n] of Object.entries(rec.refs || {})) { refs[r] = n; totals.refs[r] = (totals.refs[r] || 0) + n; }
+      let dwellSec = 0;
+      for (const sec of Object.values(rec.dwell || {})) dwellSec += Number(sec) || 0;
+      totals.total += total;
+      rows.push({
+        day: k, total: total, pages: pages,
+        groups: g.groups, sources: rec.sources || {},
+        nhom: g.nhom, moi: g.moi,
+        refs: refs, topFeatures: top(rec.features || {}, 5),
+        dwellSec: Math.round(dwellSec),
+      });
+    }
+    rows.sort((a, b) => (a.day < b.day ? 1 : -1)); // mới nhất trước
+    statsDailyJson(res, 200, { ok: true, days: keys, rows: rows, totals: totals });
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
