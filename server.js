@@ -36,6 +36,37 @@ const MERIT_POINTS = {
   chant: 5, beads: 2, mok: 2, drawFortune: 10, sit: 2, stand: 0,
 };
 
+// ---------- Cấu hình vận hành (admin chỉnh qua trang quản trị) ----------
+// Lưu trong data/config.db; đổi qua POST /admin/config có hiệu lực ngay
+// (không cần restart). Mặc định = các hằng số cũ (MERIT_POINTS / MAX_PLAYERS).
+let liveConfig = authStore.loadConfig();
+// Tôn trọng biến môi trường MAX_PLAYERS nếu chưa có file cấu hình
+// (mặc định 200 trong authStore.loadConfig).
+try {
+  const cfgPath = path.join(__dirname, 'data', 'config.db');
+  if (!fs.existsSync(cfgPath) && process.env.MAX_PLAYERS) {
+    const v = parseInt(process.env.MAX_PLAYERS, 10);
+    if (Number.isFinite(v) && v >= 10 && v <= 1000) liveConfig.max_players = v;
+  }
+} catch (e) {}
+let gameStats = authStore.loadGameStats();
+let gameStatsSaveTimer = null;
+function scheduleGameStatsSave() {
+  if (gameStatsSaveTimer) return;
+  gameStatsSaveTimer = setTimeout(() => {
+    gameStatsSaveTimer = null;
+    try { authStore.saveGameStats(gameStats); } catch (e) {}
+  }, 5000);
+}
+function meritFor(k, fallback) {
+  const v = liveConfig.merit_points && liveConfig.merit_points[k];
+  if (Number.isFinite(v)) return v;
+  const d = MERIT_POINTS[k];
+  if (Number.isFinite(d)) return d;
+  return fallback || 0;
+}
+function maxPlayers() { return liveConfig.max_players || 200; }
+
 // ---------- Bảng Vàng Công Đức (lưu file) ----------
 const DATA_DIR = path.join(__dirname, 'data');
 const MERIT_FILE = path.join(DATA_DIR, 'merit.db');
@@ -195,7 +226,7 @@ const server = http.createServer((req, res) => {
       if (m.wish) d.wish = String(m.wish).slice(0, 200);
       d.user = user;
       broadcast({ t: 'act', id: 'streamer', k: k, d: d });
-      addMerit(user, MERIT_POINTS[k] || 5);
+      addMerit(user, meritFor(k, 5));
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true }));
     });
@@ -613,6 +644,237 @@ const server = http.createServer((req, res) => {
     statsDailyJson(res, 200, { ok: true, days: keys, rows: rows, totals: totals });
     return;
   }
+  // ---------- Trang quản trị (admin.html) ----------
+  // Cấu hình vận hành + tổng quan + bình luận + bài viết + duyệt tin.
+  // Mọi endpoint /admin/* yêu cầu header x-admin-token (ADMIN_STATS_TOKEN).
+  // GET /api/config và /api/hidden-articles là công khai (web đọc để áp dụng).
+  function adminCorsHeaders() {
+    return {
+      'Access-Control-Allow-Origin': 'https://phatphaponline.pages.dev',
+      'Access-Control-Allow-Credentials': 'true',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Token',
+      'Vary': 'Origin',
+    };
+  }
+  function adminJson(res, status, obj) {
+    const h = Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, adminCorsHeaders());
+    res.writeHead(status, h);
+    res.end(JSON.stringify(obj));
+  }
+  function adminErr(res, status, code, message) { adminJson(res, status, { ok: false, error: code, message: message }); }
+  function adminOverview() {
+    const now = Date.now();
+    const today = statsDayKey(now);
+    const stats = readJson(STATS_FILE, {});
+    let viewsToday = 0, views7d = 0;
+    const keys = Object.keys(stats).sort().slice(-7);
+    for (const k of keys) {
+      const rec = stats[k] || {};
+      let tot = 0;
+      for (const n of Object.values(rec.pageviews || {})) tot += Number(n) || 0;
+      views7d += tot;
+      if (k === today) viewsToday = tot;
+    }
+    const users = authStore.loadUsers();
+    const ids = Object.keys(users);
+    const d1 = now - 24 * 3600 * 1000;
+    let newToday = 0, totalMerit = 0, totalXu = 0;
+    const topUsers = [];
+    for (const id of ids) {
+      const u = users[id];
+      if ((u.created_at || 0) >= d1) newToday++;
+      const merit = Math.max(0, Math.floor(Number((u.character && u.character.merit) || 0)));
+      totalMerit += merit;
+      totalXu += Math.max(0, Math.floor(Number(u.balance) || 0));
+      topUsers.push({ name: (u.character && u.character.name) || '?', merit: merit, level: (u.character && u.character.level) || 1 });
+    }
+    topUsers.sort((a, b) => b.merit - a.merit);
+    const comments = readCommentsFile();
+    const commentsToday = comments.filter((c) => (c.createdAt || 0) >= d1).length;
+    const gs = authStore.loadGameStats();
+    const avgSeconds = gs.total_sessions ? Math.round(gs.total_seconds / gs.total_sessions) : 0;
+    return {
+      online: players.size,
+      views_today: viewsToday, views_7d: views7d,
+      total_users: ids.length, new_users_today: newToday,
+      total_merit: totalMerit, total_xu: totalXu,
+      comments_total: comments.length, comments_today: commentsToday,
+      merit_board: boardTop(10),
+      top_users: topUsers.slice(0, 10),
+      game: { total_joins: gs.total_joins, total_sessions: gs.total_sessions, avg_seconds: avgSeconds },
+    };
+  }
+  let adminPath = null;
+  try { adminPath = new URL(req.url, 'http://localhost').pathname; } catch (e) {}
+  // GET /api/config — cấu hình công khai cho web (game, popup, banner, điểm).
+  if (adminPath === '/api/config') {
+    if (req.method === 'OPTIONS') { res.writeHead(204, adminCorsHeaders()); res.end(); return; }
+    if (req.method === 'GET') { adminJson(res, 200, { ok: true, config: liveConfig }); return; }
+  }
+  // GET /api/hidden-articles — danh sách bài đã ẩn (web lọc khi render).
+  if (adminPath === '/api/hidden-articles') {
+    if (req.method === 'OPTIONS') { res.writeHead(204, adminCorsHeaders()); res.end(); return; }
+    if (req.method === 'GET') { adminJson(res, 200, { ok: true, hidden: authStore.loadHidden() }); return; }
+  }
+  if (adminPath && adminPath.startsWith('/admin/')) {
+    if (req.method === 'OPTIONS') { res.writeHead(204, adminCorsHeaders()); res.end(); return; }
+    const chk = statsAdminTokenOk(req);
+    if (chk === 'missing') { adminErr(res, 503, 'chua_cau_hinh', 'Chưa cấu hình admin token.'); return; }
+    if (chk !== 'ok') { adminErr(res, 401, 'khong_co_quyen', 'Không có quyền quản trị.'); return; }
+    // GET /admin/overview — chỉ số tổng quan cho đầu trang quản trị.
+    if (adminPath === '/admin/overview' && req.method === 'GET') {
+      adminJson(res, 200, Object.assign({ ok: true }, adminOverview()));
+      return;
+    }
+    // GET /admin/comments?limit= — bình luận mới nhất (để duyệt/xóa).
+    if (adminPath === '/admin/comments' && req.method === 'GET') {
+      let limit = 50;
+      try { const q = parseInt(new URL(req.url, 'http://localhost').searchParams.get('limit'), 10); if (Number.isFinite(q)) limit = Math.max(1, Math.min(200, q)); } catch (e) {}
+      const list = readCommentsFile().slice(-limit).reverse().map(publicComment);
+      adminJson(res, 200, { ok: true, total: readCommentsFile().length, comments: list });
+      return;
+    }
+    // GET /admin/review — danh sách bài đã duyệt / đã từ chối (cron đọc để đăng/xóa).
+    if (adminPath === '/admin/review' && req.method === 'GET') {
+      const r = authStore.loadReview();
+      adminJson(res, 200, { ok: true, approved: r.approved, rejected: r.rejected });
+      return;
+    }
+    // Các endpoint POST bên dưới đọc body.
+    if (req.method === 'POST') {
+      readBody(req, (body) => {
+        let m;
+        try { m = JSON.parse(body); } catch (e) { adminErr(res, 400, 'bad_json', 'Dữ liệu không đúng định dạng.'); return; }
+        if (!m || typeof m !== 'object') m = {};
+        // POST /admin/config — cập nhật cấu hình vận hành (từng phần, có kiểm tra).
+        if (adminPath === '/admin/config') {
+          const next = JSON.parse(JSON.stringify(liveConfig));
+          if (m.game_enabled !== undefined) {
+            if (typeof m.game_enabled !== 'boolean') return adminErr(res, 400, 'du_lieu_khong_hop_le', 'game_enabled phải là true/false.');
+            next.game_enabled = m.game_enabled;
+          }
+          if (m.review_mode !== undefined) {
+            if (typeof m.review_mode !== 'boolean') return adminErr(res, 400, 'du_lieu_khong_hop_le', 'review_mode phải là true/false.');
+            next.review_mode = m.review_mode;
+          }
+          if (m.max_players !== undefined) {
+            const v = Math.floor(Number(m.max_players));
+            if (!Number.isFinite(v) || v < 10 || v > 1000) return adminErr(res, 400, 'du_lieu_khong_hop_le', 'Số người tối đa từ 10 đến 1000.');
+            next.max_players = v;
+          }
+          if (m.merit_points !== undefined && typeof m.merit_points === 'object') {
+            for (const [k, v] of Object.entries(m.merit_points)) {
+              if (!Object.prototype.hasOwnProperty.call(next.merit_points, k)) continue; // chỉ nhận key đã biết
+              const n = Math.floor(Number(v));
+              if (!Number.isFinite(n) || n < 0 || n > 100) return adminErr(res, 400, 'du_lieu_khong_hop_le', 'Điểm công đức mỗi hành động từ 0 đến 100.');
+              next.merit_points[k] = n;
+            }
+          }
+          if (m.announcement !== undefined && typeof m.announcement === 'object') {
+            if (m.announcement.enabled !== undefined) {
+              if (typeof m.announcement.enabled !== 'boolean') return adminErr(res, 400, 'du_lieu_khong_hop_le', 'announcement.enabled phải là true/false.');
+              next.announcement.enabled = m.announcement.enabled;
+            }
+            if (m.announcement.text !== undefined) {
+              if (typeof m.announcement.text !== 'string') return adminErr(res, 400, 'du_lieu_khong_hop_le', 'Nội dung thông báo phải là chữ.');
+              next.announcement.text = m.announcement.text.slice(0, 300);
+            }
+          }
+          if (m.popup !== undefined && typeof m.popup === 'object') {
+            for (const page of ['doanhnhan', 'mebe', 'cauchuyen']) {
+              const p = m.popup[page];
+              if (p && typeof p === 'object') {
+                for (const f of ['title', 'text', 'ctaText', 'ctaHref']) {
+                  if (p[f] !== undefined) {
+                    if (typeof p[f] !== 'string') return adminErr(res, 400, 'du_lieu_khong_hop_le', 'Nội dung popup phải là chữ.');
+                    next.popup[page][f] = p[f].slice(0, 300);
+                  }
+                }
+              }
+            }
+          }
+          liveConfig = next;
+          try { authStore.saveConfig(next); } catch (e) { return adminErr(res, 500, 'luu_that_bai', 'Không lưu được cấu hình.'); }
+          authStore.appendAdminLog({ action: 'config_update', detail: 'Cập nhật cấu hình vận hành', after: next });
+          adminJson(res, 200, { ok: true, config: next });
+          return;
+        }
+        // POST /admin/comment/delete {comment_id, reason?} — xóa bình luận vi phạm/spam.
+        if (adminPath === '/admin/comment/delete') {
+          const id = String(m.comment_id || '');
+          if (!id) return adminErr(res, 400, 'thieu_id', 'Thiếu id bình luận.');
+          const all = readCommentsFile();
+          const idx = all.findIndex((c) => c.id === id);
+          if (idx < 0) return adminErr(res, 404, 'khong_tim_thay', 'Không tìm thấy bình luận.');
+          const removed = all[idx];
+          all.splice(idx, 1);
+          try {
+            fs.writeFileSync(COMMENTS_FILE, all.map((c) => JSON.stringify(c)).join('\n') + (all.length ? '\n' : ''));
+          } catch (e) { return adminErr(res, 500, 'xoa_that_bai', 'Không xóa được bình luận.'); }
+          authStore.appendAdminLog({
+            action: 'comment_delete', target: removed.articleId || '',
+            detail: 'Xóa bình luận của ' + (removed.name || '?') + ': "' + String(removed.text || '').slice(0, 80) + '"',
+            reason: String(m.reason || '').slice(0, 200),
+          });
+          adminJson(res, 200, { ok: true, deleted: id });
+          return;
+        }
+        // POST /admin/article/hide {id, hidden} — ẩn/hiện bài khỏi danh sách.
+        if (adminPath === '/admin/article/hide') {
+          const id = String(m.id || '');
+          if (!validArticleId(id)) return adminErr(res, 400, 'bad_article', 'Id bài không hợp lệ.');
+          const hidden = m.hidden === true;
+          let list = authStore.loadHidden();
+          if (hidden) { if (!list.includes(id)) list.push(id); }
+          else { list = list.filter((x) => x !== id); }
+          authStore.saveHidden(list);
+          authStore.appendAdminLog({ action: hidden ? 'article_hide' : 'article_show', target: id, detail: hidden ? 'Ẩn bài khỏi danh sách' : 'Hiện lại bài' });
+          adminJson(res, 200, { ok: true, hidden: list });
+          return;
+        }
+        // POST /admin/article/approve {id} — duyệt bài chờ đăng (cron đăng ở lần chạy sau).
+        if (adminPath === '/admin/article/approve') {
+          const id = String(m.id || '');
+          if (!validArticleId(id)) return adminErr(res, 400, 'bad_article', 'Id bài không hợp lệ.');
+          const r = authStore.loadReview();
+          r.rejected = r.rejected.filter((x) => x !== id);
+          if (!r.approved.includes(id)) r.approved.push(id);
+          authStore.saveReview(r);
+          authStore.appendAdminLog({ action: 'article_approve', target: id, detail: 'Duyệt bài chờ đăng' });
+          adminJson(res, 200, { ok: true, approved: r.approved, rejected: r.rejected });
+          return;
+        }
+        // POST /admin/article/reject {id} — từ chối bài chờ đăng (không đăng).
+        if (adminPath === '/admin/article/reject') {
+          const id = String(m.id || '');
+          if (!validArticleId(id)) return adminErr(res, 400, 'bad_article', 'Id bài không hợp lệ.');
+          const r = authStore.loadReview();
+          r.approved = r.approved.filter((x) => x !== id);
+          if (!r.rejected.includes(id)) r.rejected.push(id);
+          authStore.saveReview(r);
+          authStore.appendAdminLog({ action: 'article_reject', target: id, detail: 'Từ chối bài chờ đăng' });
+          adminJson(res, 200, { ok: true, approved: r.approved, rejected: r.rejected });
+          return;
+        }
+        // POST /admin/article/done {id} — cron báo đã xử lý xong (đăng hoặc bỏ).
+        if (adminPath === '/admin/article/done') {
+          const id = String(m.id || '');
+          if (!validArticleId(id)) return adminErr(res, 400, 'bad_article', 'Id bài không hợp lệ.');
+          const r = authStore.loadReview();
+          r.approved = r.approved.filter((x) => x !== id);
+          r.rejected = r.rejected.filter((x) => x !== id);
+          authStore.saveReview(r);
+          adminJson(res, 200, { ok: true, approved: r.approved, rejected: r.rejected });
+          return;
+        }
+        adminErr(res, 404, 'khong_tim_thay', 'Không tìm thấy.');
+      });
+      return;
+    }
+    adminErr(res, 404, 'khong_tim_thay', 'Không tìm thấy.');
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('Chua Online multiplayer server OK - ' + players.size + ' nguoi online');
 });
@@ -621,7 +883,13 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server, maxPayload: 64 * 1024 });
 
 wss.on('connection', (ws) => {
-  if (players.size >= MAX_PLAYERS) {
+  // Game tắt (bảo trì) từ trang quản trị: không nhận người chơi mới.
+  if (!liveConfig.game_enabled) {
+    try { ws.send(JSON.stringify({ t: 'maintenance' })); } catch (e) {}
+    ws.close();
+    return;
+  }
+  if (players.size >= maxPlayers()) {
     try { ws.send(JSON.stringify({ t: 'full' })); } catch (e) {}
     ws.close();
     return;
@@ -645,6 +913,9 @@ wss.on('connection', (ws) => {
       p.level = (Number.isFinite(lv) && lv >= 1 && lv <= 10) ? lv : 0;
       p.levelName = sanitizeName(m.levelName);
       p.hello = true;
+      p.joinAt = Date.now();
+      gameStats.total_joins += 1;
+      scheduleGameStatsSave();
       const others = [];
       for (const q of players.values()) { if (q.id !== id && q.hello) others.push(publicState(q)); }
       ws.send(JSON.stringify({ t: 'welcome', id: id, players: others, merit: boardTop(10), chat: chatHistory.slice(-20) }));
@@ -663,7 +934,7 @@ wss.on('connection', (ws) => {
       const d = (m.d && typeof m.d === 'object') ? m.d : {};
       d.user = p.name;
       broadcast({ t: 'act', id: id, k: k, d: d }, id);
-      addMerit(p.name, MERIT_POINTS[k] || 0);
+      addMerit(p.name, meritFor(k, 0));
     } else if (m.t === 'chat' && p.hello) {
       // Chat chung: mọi người nói chuyện tự nhiên (quán trà đá).
       // Chống spam: tối thiểu 1.5s/tin, tối đa 200 ký tự, lọc ký tự HTML.
@@ -682,7 +953,16 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => { clearInterval(hb); players.delete(id); broadcast({ t: 'leave', id: id }); });
+  ws.on('close', () => {
+    clearInterval(hb);
+    // Thống kê game: đếm phiên chơi + tổng thời gian (cho tab Game ở trang quản trị).
+    if (p.hello && p.joinAt) {
+      gameStats.total_sessions += 1;
+      gameStats.total_seconds += Math.max(0, Math.round((Date.now() - p.joinAt) / 1000));
+      scheduleGameStatsSave();
+    }
+    players.delete(id); broadcast({ t: 'leave', id: id });
+  });
   ws.on('error', () => {});
 
   const hb = setInterval(() => {

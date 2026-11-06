@@ -14,6 +14,11 @@ const USERS_FILE = path.join(DATA_DIR, 'users.db');
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.db');
 const RESETS_FILE = path.join(DATA_DIR, 'resets.db');
 const LEDGER_FILE = path.join(DATA_DIR, 'ledger.db');
+const ADMIN_LOG_FILE = path.join(DATA_DIR, 'admin-log.db');
+const CONFIG_FILE = path.join(DATA_DIR, 'config.db');
+const HIDDEN_FILE = path.join(DATA_DIR, 'hidden-articles.db');
+const REVIEW_FILE = path.join(DATA_DIR, 'review-queue.db');
+const GAME_STATS_FILE = path.join(DATA_DIR, 'game-stats.db');
 
 function ensureDir() {
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
@@ -196,6 +201,108 @@ function newUserId() {
   return 'usr_' + crypto.randomBytes(8).toString('hex');
 }
 
+// ---------- Nhật ký thao tác admin (append-only, tối đa 2000 dòng) ----------
+// Entry: { at, action, user_id, target, detail, before, after, reason }
+function loadAdminLog() {
+  const v = readJson(ADMIN_LOG_FILE, []);
+  return Array.isArray(v) ? v : [];
+}
+function appendAdminLog(entry) {
+  const l = loadAdminLog();
+  l.push(Object.assign({ at: Date.now() }, entry || {}));
+  const trimmed = l.length > 2000 ? l.slice(l.length - 2000) : l;
+  writeJson(ADMIN_LOG_FILE, trimmed);
+}
+function adminLogForUser(userId, limit) {
+  return loadAdminLog().filter((e) => e && e.user_id === userId).slice(-(limit || 50)).reverse();
+}
+
+// ---------- Cấu hình vận hành web (admin chỉnh qua trang quản trị) ----------
+const DEFAULT_CONFIG = {
+  game_enabled: true,
+  review_mode: false,
+  max_players: 200,
+  merit_points: {
+    incense: 15, prostrate: 15, bell: 10, lantern: 10, wishcard: 10,
+    chant: 5, beads: 2, mok: 2, drawFortune: 10, sit: 2, stand: 0,
+  },
+  announcement: { enabled: false, text: '' },
+  popup: {
+    doanhnhan: { title: '', text: '', ctaText: '', ctaHref: '' },
+    mebe: { title: '', text: '', ctaText: '', ctaHref: '' },
+    cauchuyen: { title: '', text: '', ctaText: '', ctaHref: '' },
+  },
+};
+function loadConfig() {
+  const raw = readJson(CONFIG_FILE, {});
+  const cfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+  if (raw && typeof raw === 'object') {
+    if (typeof raw.game_enabled === 'boolean') cfg.game_enabled = raw.game_enabled;
+    if (typeof raw.review_mode === 'boolean') cfg.review_mode = raw.review_mode;
+    if (Number.isFinite(raw.max_players)) cfg.max_players = Math.max(10, Math.min(1000, Math.floor(raw.max_players)));
+    if (raw.merit_points && typeof raw.merit_points === 'object') {
+      for (const k of Object.keys(cfg.merit_points)) {
+        if (Number.isFinite(raw.merit_points[k])) cfg.merit_points[k] = Math.max(0, Math.min(100, Math.floor(raw.merit_points[k])));
+      }
+    }
+    if (raw.announcement && typeof raw.announcement === 'object') {
+      if (typeof raw.announcement.enabled === 'boolean') cfg.announcement.enabled = raw.announcement.enabled;
+      if (typeof raw.announcement.text === 'string') cfg.announcement.text = raw.announcement.text.slice(0, 300);
+    }
+    if (raw.popup && typeof raw.popup === 'object') {
+      for (const page of ['doanhnhan', 'mebe', 'cauchuyen']) {
+        const p = raw.popup[page];
+        if (p && typeof p === 'object') {
+          for (const f of ['title', 'text', 'ctaText', 'ctaHref']) {
+            if (typeof p[f] === 'string') cfg.popup[page][f] = p[f].slice(0, 300);
+          }
+        }
+      }
+    }
+  }
+  return cfg;
+}
+function saveConfig(cfg) { writeJson(CONFIG_FILE, cfg); }
+
+// ---------- Bài ẩn khỏi danh sách (mảng id) ----------
+function loadHidden() {
+  const v = readJson(HIDDEN_FILE, []);
+  return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
+}
+function saveHidden(ids) { writeJson(HIDDEN_FILE, ids); }
+
+// ---------- Hàng chờ duyệt bài (cron viết → admin duyệt mới đăng) ----------
+function loadReview() {
+  const v = readJson(REVIEW_FILE, { approved: [], rejected: [] });
+  return {
+    approved: Array.isArray(v.approved) ? v.approved : [],
+    rejected: Array.isArray(v.rejected) ? v.rejected : [],
+  };
+}
+function saveReview(r) { writeJson(REVIEW_FILE, r); }
+
+// ---------- Thống kê game (tổng lượt vào, tổng phiên, tổng giây) ----------
+function loadGameStats() {
+  const v = readJson(GAME_STATS_FILE, {});
+  return {
+    total_joins: Math.max(0, Math.floor(Number(v.total_joins) || 0)),
+    total_sessions: Math.max(0, Math.floor(Number(v.total_sessions) || 0)),
+    total_seconds: Math.max(0, Math.floor(Number(v.total_seconds) || 0)),
+  };
+}
+function saveGameStats(s) { writeJson(GAME_STATS_FILE, s); }
+
+// Đổi tên nhân vật: dời điểm game (key = tên) từ tên cũ sang tên mới (lấy max).
+function migrateGameMeritName(oldName, newName) {
+  if (!oldName || !newName || oldName === newName) return;
+  const gm = readJson(path.join(DATA_DIR, 'merit.db'), {});
+  if (gm && typeof gm === 'object' && Number(gm[oldName])) {
+    gm[newName] = Math.max(Number(gm[newName]) || 0, Number(gm[oldName]) || 0);
+    delete gm[oldName];
+    writeJson(path.join(DATA_DIR, 'merit.db'), gm);
+  }
+}
+
 module.exports = {
   DATA_DIR,
   readJson, writeJson,
@@ -207,4 +314,10 @@ module.exports = {
   MERIT_LEVELS, levelFromMerit, syncMeritFromGame,
   AVATAR_UNLOCKS, avatarImageForId,
   validEmail, normalizePhone, newUserId,
+  loadAdminLog, appendAdminLog, adminLogForUser,
+  DEFAULT_CONFIG, loadConfig, saveConfig,
+  loadHidden, saveHidden,
+  loadReview, saveReview,
+  loadGameStats, saveGameStats,
+  migrateGameMeritName,
 };

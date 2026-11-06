@@ -25,7 +25,7 @@ function corsHeaders() {
     'Access-Control-Allow-Origin': WEB_ORIGIN,
     'Access-Control-Allow-Credentials': 'true',
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Token',
     'Vary': 'Origin',
   };
 }
@@ -200,6 +200,13 @@ async function handleAuth(req, res) {
     if (route === '/character' && req.method === 'PATCH') return doCharacterPatch(req, res, body);
     if (route === '/earn' && req.method === 'POST') return await doEarn(req, res, body);
     if (route === '/admin/stats' && req.method === 'GET') return doAdminStats(req, res);
+    if (route === '/admin/users' && req.method === 'GET') return doAdminUsers(req, res);
+    if (route === '/admin/user' && req.method === 'GET') return doAdminUserDetail(req, res);
+    if (route === '/admin/user/lock' && req.method === 'POST') return doAdminUserLock(req, res, body);
+    if (route === '/admin/user/update' && req.method === 'POST') return doAdminUserUpdate(req, res, body);
+    if (route === '/admin/user/reset-link' && req.method === 'POST') return doAdminResetLink(req, res, body);
+    if (route === '/admin/points' && req.method === 'POST') return doAdminPoints(req, res, body);
+    if (route === '/admin/log' && req.method === 'GET') return doAdminLog(req, res);
   } catch (e) {
     console.log('[auth] lỗi: ' + (e && e.message));
     return err(res, 500, 'loi_he_thong', 'Hệ thống bận, thí chủ thử lại sau.');
@@ -293,6 +300,11 @@ async function doLogin(req, res, body) {
   const users = store.loadUsers();
   const user = email ? store.findByEmail(users, email) : store.findByPhone(users, phone);
   const now = Date.now();
+  // Tài khoản bị admin khóa thì không đăng nhập được (mở khóa lại được).
+  if (user && user.admin_locked) {
+    return err(res, 423, 'tai_khoan_bi_khoa',
+      'Tài khoản này đã bị khóa bởi quản trị. Thí chủ liên hệ hỗ trợ để mở lại.');
+  }
   // Dùng 1 mã lỗi chung cho "không tồn tại" và "sai mật khẩu" — chống dò tài khoản.
   if (user && user.locked_until && user.locked_until > now) {
     const retry = Math.ceil((user.locked_until - now) / 1000);
@@ -654,4 +666,258 @@ function doAdminStats(req, res) {
     total_xu_circulation: xu,
     users: list,
   });
+}
+
+// ---------- Trang quản trị (admin.html) ----------
+// Mọi endpoint dưới đây yêu cầu header x-admin-token (ADMIN_STATS_TOKEN).
+// Không bao giờ trả password_hash / IP. Mọi thao tác đổi dữ liệu ghi admin-log.
+
+function adminGuard(req, res) {
+  const chk = adminTokenOk(req);
+  if (chk === 'missing') {
+    err(res, 503, 'chua_cau_hinh', 'Chưa cấu hình admin token (biến môi trường ADMIN_STATS_TOKEN).');
+    return false;
+  }
+  if (chk !== 'ok') {
+    err(res, 403, 'khong_co_quyen', 'Không có quyền quản trị.');
+    return false;
+  }
+  return true;
+}
+
+// Dòng hồ sơ cho danh sách (email/SĐT che bớt, không lộ dữ liệu nhạy cảm).
+function adminUserSummary(u) {
+  const c = u.character || {};
+  return {
+    id: u.id,
+    identifier_masked: u.email ? maskEmail(u.email) : maskPhone(u.phone),
+    name: c.name || null,
+    phapDanh: c.phapDanh || null,
+    avatar: c.avatar || 'unlock-1',
+    level: c.level || 1,
+    level_name: c.level_name || 'Phật tử mới',
+    merit: c.merit || 0,
+    balance: u.balance || 0,
+    created_at: u.created_at || 0,
+    last_login_at: u.last_login_at || 0,
+    locked: !!u.admin_locked,
+    lock_reason: u.admin_lock_reason || null,
+  };
+}
+
+// GET /auth/admin/users?search=&level= — liệt kê hồ sơ (mới nhất trước).
+function doAdminUsers(req, res) {
+  if (!adminGuard(req, res)) return;
+  let q = {};
+  try { q = new URL(req.url, 'http://localhost').searchParams; } catch (e) {}
+  const search = (q.get('search') || '').trim().toLowerCase();
+  const level = parseInt(q.get('level') || '0', 10) || 0;
+  const users = store.loadUsers();
+  let list = Object.keys(users).map((id) => users[id]);
+  if (search) {
+    list = list.filter((u) => {
+      const hay = [
+        (u.character && u.character.name) || '',
+        (u.character && u.character.phapDanh) || '',
+        u.email || '', u.phone || '', u.id || '',
+      ].join(' ').toLowerCase();
+      return hay.indexOf(search) !== -1;
+    });
+  }
+  if (level >= 1 && level <= 10) list = list.filter((u) => ((u.character && u.character.level) || 1) === level);
+  list.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  return json(res, 200, { ok: true, total: list.length, users: list.map(adminUserSummary) });
+}
+
+// GET /auth/admin/user?id= — chi tiết 1 hồ sơ + sổ cái xu + nhật ký admin.
+function doAdminUserDetail(req, res) {
+  if (!adminGuard(req, res)) return;
+  let q = {};
+  try { q = new URL(req.url, 'http://localhost').searchParams; } catch (e) {}
+  const id = String(q.get('id') || '');
+  const users = store.loadUsers();
+  const u = users[id];
+  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  const c = u.character || {};
+  return json(res, 200, {
+    ok: true,
+    user: Object.assign(adminUserSummary(u), {
+      renamed_count: c.renamed_count || 0,
+      character_updated_at: c.updated_at || 0,
+      failed_attempts: u.failed_attempts || 0,
+      temp_locked_until: u.locked_until || 0,
+    }),
+    ledger: store.ledgerForUser(u.id, 20),
+    admin_log: store.adminLogForUser(u.id, 20),
+  });
+}
+
+// POST /auth/admin/user/lock {user_id, locked, reason} — khoá/mở khoá tài khoản.
+// Khi khoá: hủy toàn bộ session (người dùng bị đăng xuất ngay).
+function doAdminUserLock(req, res, body) {
+  if (!adminGuard(req, res)) return;
+  const userId = String(body.user_id || '');
+  const locked = body.locked === true;
+  const reason = String(body.reason || '').trim().slice(0, 200);
+  const users = store.loadUsers();
+  const u = users[userId];
+  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  const before = !!u.admin_locked;
+  if (before === locked) {
+    return json(res, 200, { ok: true, locked: locked, changed: false, user: adminUserSummary(u) });
+  }
+  u.admin_locked = locked;
+  u.admin_lock_reason = locked ? (reason || 'Khóa bởi quản trị') : null;
+  u.admin_lock_at = locked ? Date.now() : null;
+  store.saveUsers(users);
+  if (locked) {
+    const sessions = store.loadSessions();
+    let changed = false;
+    for (const k of Object.keys(sessions)) {
+      if (sessions[k] && sessions[k].user_id === userId) { delete sessions[k]; changed = true; }
+    }
+    if (changed) store.saveSessions(sessions);
+  }
+  store.appendAdminLog({
+    action: locked ? 'user_lock' : 'user_unlock', user_id: userId,
+    target: (u.character && u.character.name) || userId,
+    detail: locked ? 'Khóa tài khoản' : 'Mở khóa tài khoản',
+    before: before, after: locked, reason: reason,
+  });
+  return json(res, 200, { ok: true, locked: locked, changed: true, user: adminUserSummary(u) });
+}
+
+// POST /auth/admin/user/update {user_id, name?, phapDanh?} — sửa tên nhân vật / pháp danh.
+// Admin được sửa không giới hạn số lần (khác luồng người dùng tự đổi). Đổi tên
+// nhân vật thì dời điểm game (key = tên) sang tên mới để Bảng Vàng không mất điểm.
+function doAdminUserUpdate(req, res, body) {
+  if (!adminGuard(req, res)) return;
+  const userId = String(body.user_id || '');
+  const users = store.loadUsers();
+  const u = users[userId];
+  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  const c = u.character || {};
+  const hasName = body.name !== undefined && body.name !== null && String(body.name).trim() !== '';
+  const hasPhapDanh = body.phapDanh !== undefined && body.phapDanh !== null && String(body.phapDanh).trim() !== '';
+  if (!hasName && !hasPhapDanh) {
+    return err(res, 400, 'khong_co_gi_thay_doi', 'Không có thông tin nào để cập nhật.');
+  }
+  const before = { name: c.name || null, phapDanh: c.phapDanh || null };
+  let newName = null, newPhapDanh = null;
+  if (hasName) {
+    newName = sanitizeCharName(body.name);
+    if (!newName) return err(res, 400, 'ten_khong_hop_le', 'Tên nhân vật 1–20 ký tự.');
+    if (newName !== c.name && store.characterNameTaken(users, newName, userId)) {
+      return err(res, 409, 'ten_nhan_vat_ton_tai', 'Tên nhân vật này đã có người dùng.');
+    }
+  }
+  if (hasPhapDanh) {
+    newPhapDanh = String(body.phapDanh).trim();
+    if (!validPhapDanh(newPhapDanh)) {
+      return err(res, 400, 'phap_danh_khong_hop_le', 'Pháp danh 2–20 ký tự, chỉ chữ, số, khoảng trắng và gạch ngang, không chứa link.');
+    }
+  }
+  if (newName && newName !== c.name) {
+    const oldName = c.name;
+    c.name = newName;
+    store.migrateGameMeritName(oldName, newName);
+  }
+  if (newPhapDanh) c.phapDanh = newPhapDanh;
+  c.updated_at = Date.now();
+  store.saveUsers(users);
+  store.appendAdminLog({
+    action: 'user_update', user_id: userId, target: c.name || userId,
+    detail: 'Sửa hồ sơ', before: before, after: { name: c.name, phapDanh: c.phapDanh || null },
+  });
+  return json(res, 200, { ok: true, user: adminUserSummary(u) });
+}
+
+// POST /auth/admin/user/reset-link {user_id} — tạo link đặt lại mật khẩu 1 lần
+// (hết hạn 60 phút). Admin tự gửi link cho người dùng qua kênh riêng.
+function doAdminResetLink(req, res, body) {
+  if (!adminGuard(req, res)) return;
+  const userId = String(body.user_id || '');
+  const users = store.loadUsers();
+  const u = users[userId];
+  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  const token = crypto.randomBytes(32).toString('hex');
+  const resets = store.loadResets();
+  resets[store.sha256hex(token)] = {
+    user_id: userId, email: u.email || null, phone: u.phone || null,
+    expires_at: Date.now() + 60 * 60 * 1000, used: false, created_by_admin: true,
+  };
+  store.saveResets(resets);
+  store.appendAdminLog({
+    action: 'user_reset_link', user_id: userId, target: (u.character && u.character.name) || userId,
+    detail: 'Tạo link đặt lại mật khẩu (1 lần, 60 phút)',
+  });
+  return json(res, 200, { ok: true, reset_link: WEB_BASE + '/?reset=' + token, expires_minutes: 60 });
+}
+
+// POST /auth/admin/points {user_id, merit_delta?, xu_delta?, reason}
+// Cộng/trừ công đức và/hoặc xu. Cộng công đức tính lại cấp bằng levelFromMerit.
+// Công đức không âm. Ghi sổ cái xu + nhật ký admin (trước/sau) để đối soát.
+function doAdminPoints(req, res, body) {
+  if (!adminGuard(req, res)) return;
+  const userId = String(body.user_id || '');
+  const reason = String(body.reason || '').trim();
+  const meritDelta = Number(body.merit_delta) || 0;
+  const xuDelta = Number(body.xu_delta) || 0;
+  if (!reason) return err(res, 400, 'thieu_ly_do', 'Cần nhập lý do cộng/trừ điểm.');
+  if (reason.length > 200) return err(res, 400, 'ly_do_quai_dai', 'Lý do tối đa 200 ký tự.');
+  if (!Number.isInteger(meritDelta) || Math.abs(meritDelta) > 10000) {
+    return err(res, 400, 'diem_khong_hop_le', 'Điểm công đức mỗi lần từ -10000 đến 10000.');
+  }
+  if (!Number.isInteger(xuDelta) || Math.abs(xuDelta) > 100000) {
+    return err(res, 400, 'xu_khong_hop_le', 'Xu mỗi lần từ -100000 đến 100000.');
+  }
+  if (meritDelta === 0 && xuDelta === 0) {
+    return err(res, 400, 'khong_co_gi_thay_doi', 'Điểm và xu đều bằng 0 — không có gì để cập nhật.');
+  }
+  const users = store.loadUsers();
+  const u = users[userId];
+  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  const c = u.character || {};
+  const before = { merit: c.merit || 0, level: c.level || 1, level_name: c.level_name || 'Phật tử mới', balance: u.balance || 0 };
+  if (meritDelta !== 0) {
+    const newMerit = Math.max(0, (c.merit || 0) + meritDelta);
+    c.merit = newMerit;
+    const lv = store.levelFromMerit(newMerit);
+    c.level = lv.level;
+    c.level_name = lv.level_name;
+    c.updated_at = Date.now();
+  }
+  if (xuDelta !== 0) {
+    if (xuDelta < 0 && (u.balance || 0) + xuDelta < 0) {
+      return err(res, 400, 'xu_khong_du', 'Số xu hiện có không đủ để trừ ' + Math.abs(xuDelta) + ' xu.');
+    }
+    // Cộng/trừ xu trực tiếp trên bản users đang giữ (addBalance nạp lại file
+    // riêng nên không dùng được ở đây — sẽ ghi đè điểm công đức vừa đổi).
+    u.balance = (u.balance || 0) + xuDelta;
+    store.appendLedger({
+      user_id: userId, type: 'tang', amount: xuDelta, balance_after: u.balance,
+      reason: '[admin] ' + reason, at: Date.now(),
+    });
+  }
+  store.saveUsers(users);
+  const after = { merit: c.merit || 0, level: c.level || 1, level_name: c.level_name || 'Phật tử mới', balance: u.balance || 0 };
+  store.appendAdminLog({
+    action: 'points_adjust', user_id: userId, target: c.name || userId,
+    detail: 'Điều chỉnh điểm: công đức ' + (meritDelta >= 0 ? '+' : '') + meritDelta +
+      ', xu ' + (xuDelta >= 0 ? '+' : '') + xuDelta,
+    before: before, after: after, reason: reason,
+  });
+  return json(res, 200, { ok: true, user: adminUserSummary(u) });
+}
+
+// GET /auth/admin/log?limit=&action= — nhật ký thao tác admin (mới nhất trước).
+function doAdminLog(req, res) {
+  if (!adminGuard(req, res)) return;
+  let q = {};
+  try { q = new URL(req.url, 'http://localhost').searchParams; } catch (e) {}
+  const limit = Math.max(1, Math.min(200, parseInt(q.get('limit') || '100', 10) || 100));
+  const action = (q.get('action') || '').trim();
+  let log = store.loadAdminLog();
+  if (action) log = log.filter((e) => e && e.action === action);
+  return json(res, 200, { ok: true, total: log.length, log: log.slice(-limit).reverse() });
 }
