@@ -30,6 +30,62 @@ const POINTS_PROFILE_BONUS = 30;
 const POINTS_EARN = { comment: 10, like: 10, share: 20 };
 const POINTS_TRANSFER_MIN_STREAK_DAYS = 30; // chuyển điểm cần online liên tiếp 30 ngày
 const POINTS_ACTIVE_DAYS_KEEP = 45; // giữ tối đa 45 ngày online gần nhất trên user.active_days
+const PARTNER_DEFAULT_BALANCE = 1000; // tài khoản đối tác (admin tạo) có số dư mặc định 1000 điểm
+
+// ---------- Đối tác + Vi phạm (Thọ chốt 07/11/2026) ----------
+// Đối tác: dùng điểm NHƯ tài khoản thường (−20/−50), KHÔNG chuyển điểm
+// (không gửi, không nhận), vẫn +10 công đức, vẫn chịu vi phạm.
+// Vi phạm: admin khóa tính năng (theo thời hạn) hoặc trừ điểm (ghi sổ cái).
+// Tính năng khóa được: mọi service của /points/use + 'xem-chuyen-sau' (view) + '*' (tất cả).
+const LOCKABLE_FEATURES = [
+  'xemque', 'laso', 'luanlaso', 'vanhan', 'ngaytot', 'tuong', 'hoptuoi',
+  'datten', 'phongthuy', 'mohang', 'vochong', 'hoagiai', 'huongnha',
+  'vanmenh', 'somayman', 'xinxam', 'ai-luan', 'sutrutri', 'xem-chuyen-sau', '*',
+];
+const FEATURE_LABELS = {
+  'xemque': 'Gieo quẻ', 'laso': 'Lập lá số', 'luanlaso': 'Luận lá số',
+  'vanhan': 'Vận hạn', 'ngaytot': 'Ngày tốt', 'tuong': 'Nhân tướng học',
+  'hoptuoi': 'Hợp tuổi', 'datten': 'Đặt tên bé', 'phongthuy': 'Phong thủy',
+  'mohang': 'Mở hàng', 'vochong': 'Vợ chồng', 'hoagiai': 'Hóa giải',
+  'huongnha': 'Hướng nhà', 'vanmenh': 'Vận mệnh', 'somayman': 'Số may mắn',
+  'xinxam': 'Xin xăm', 'ai-luan': 'Trợ lý AI luận giải', 'sutrutri': 'Hỏi Sư Trụ Trì',
+  'xem-chuyen-sau': 'Xem chuyên sâu', '*': 'Tất cả tính năng',
+};
+const LOCK_DURATIONS = { 'forever': 0, '1d': 24 * 3600 * 1000, '7d': 7 * 24 * 3600 * 1000, '30d': 30 * 24 * 3600 * 1000 };
+const LOCK_DURATION_LABELS = { 'forever': 'vĩnh viễn', '1d': '1 ngày', '7d': '7 ngày', '30d': '30 ngày' };
+function featureLabel(service) {
+  return FEATURE_LABELS[String(service || '').toLowerCase()] || String(service || 'tính năng');
+}
+// Khóa đang còn hiệu lực của 1 tính năng (kiểm cả khóa '*' = tất cả).
+// Khóa hết hạn tự hết hiệu lực theo thời gian — không cần cron dọn.
+function getActiveLock(user, feature) {
+  if (!user || !user.feature_locks) return null;
+  const now = Date.now();
+  const f = String(feature || '').toLowerCase();
+  const locks = user.feature_locks;
+  for (const key of [f, '*']) {
+    const lk = locks[key];
+    if (lk && typeof lk === 'object' && lk.reason) {
+      if (!lk.expires_at || lk.expires_at > now) {
+        return { feature: key, reason: lk.reason, expires_at: lk.expires_at || 0, at: lk.at || 0 };
+      }
+    }
+  }
+  return null;
+}
+// Danh sách khóa đang còn hiệu lực (để admin xem): [{feature, label, reason, expires_at}]
+function activeLocks(user) {
+  if (!user || !user.feature_locks) return [];
+  const now = Date.now();
+  const out = [];
+  for (const key of Object.keys(user.feature_locks)) {
+    const lk = user.feature_locks[key];
+    if (lk && typeof lk === 'object' && lk.reason && (!lk.expires_at || lk.expires_at > now)) {
+      out.push({ feature: key, label: featureLabel(key), reason: lk.reason, expires_at: lk.expires_at || 0, at: lk.at || 0 });
+    }
+  }
+  return out;
+}
 
 // ---------- CORS ----------
 function corsHeaders() {
@@ -112,6 +168,7 @@ function publicUser(u) {
     phone: u.phone || null,
     character: publicCharacter(u.character),
     balance: u.balance || 0,
+    partner: !!u.partner, // tài khoản đối tác (tạm): dùng điểm như thường, không chuyển điểm
     created_at: u.created_at,
   };
 }
@@ -223,6 +280,11 @@ async function handleAuth(req, res) {
     if (route === '/admin/user/update' && req.method === 'POST') return doAdminUserUpdate(req, res, body);
     if (route === '/admin/user/reset-link' && req.method === 'POST') return doAdminResetLink(req, res, body);
     if (route === '/admin/points' && req.method === 'POST') return doAdminPoints(req, res, body);
+    if (route === '/admin/user/partner-create' && req.method === 'POST') return await doAdminPartnerCreate(req, res, body);
+    if (route === '/admin/user/partner' && req.method === 'POST') return doAdminPartner(req, res, body);
+    if (route === '/admin/user/violation-lock' && req.method === 'POST') return doAdminViolationLock(req, res, body);
+    if (route === '/admin/user/violation-deduct' && req.method === 'POST') return doAdminViolationDeduct(req, res, body);
+    if (route === '/admin/user/delete-partner' && req.method === 'POST') return doAdminDeletePartner(req, res, body);
     if (route === '/admin/log' && req.method === 'GET') return doAdminLog(req, res);
   } catch (e) {
     console.log('[auth] lỗi: ' + (e && e.message));
@@ -673,6 +735,14 @@ function doPointsUse(req, res, body) {
     return err(res, 400, 'dich_vu_khong_hop_le', 'Tên dịch vụ chưa đúng.');
   }
   const balance = Math.max(0, Math.floor(Number(a.user.balance) || 0));
+  // Vi phạm: tính năng bị khóa thì chặn TRƯỚC cả kiểm tra điểm (đối tác cũng bị chặn).
+  const lock = getActiveLock(a.user, service);
+  if (lock) {
+    return err(res, 403, 'tinh_nang_bi_khoa',
+      'Tính năng ' + featureLabel(service) + ' đang tạm khóa' + (lock.expires_at ? ' đến ' + new Date(lock.expires_at).toLocaleDateString('vi-VN') : ' vĩnh viễn') + '.',
+      { feature: service, reason: lock.reason, expires_at: lock.expires_at || 0 });
+  }
+  // Đối tác dùng điểm NHƯ tài khoản thường (−20/lần, trừ từ số dư 1000) — KHÔNG bypass (Thọ đơn giản hoá 21:47).
   if (balance < POINTS_USE_COST) {
     return err(res, 402, 'khong_du_diem',
       'Thí chủ còn ' + balance + ' điểm, dùng dịch vụ này cần ' + POINTS_USE_COST + ' điểm.',
@@ -695,6 +765,14 @@ function doPointsView(req, res, body) {
     return err(res, 400, 'bai_viet_khong_hop_le', 'Tên bài viết chưa đúng.');
   }
   const balance = Math.max(0, Math.floor(Number(a.user.balance) || 0));
+  // Vi phạm: mục chuyên sâu bị khóa thì chặn trước (đối tác cũng bị chặn).
+  const lock = getActiveLock(a.user, 'xem-chuyen-sau');
+  if (lock) {
+    return err(res, 403, 'tinh_nang_bi_khoa',
+      'Tính năng ' + featureLabel('xem-chuyen-sau') + ' đang tạm khóa' + (lock.expires_at ? ' đến ' + new Date(lock.expires_at).toLocaleDateString('vi-VN') : ' vĩnh viễn') + '.',
+      { feature: 'xem-chuyen-sau', reason: lock.reason, expires_at: lock.expires_at || 0 });
+  }
+  // Đối tác dùng điểm NHƯ tài khoản thường (−50/lần, trừ từ số dư 1000) — KHÔNG bypass (Thọ đơn giản hoá 21:47).
   if (balance < POINTS_VIEW_COST) {
     return err(res, 402, 'khong_du_diem',
       'Thí chủ còn ' + balance + ' điểm, xem bài chuyên sâu cần ' + POINTS_VIEW_COST + ' điểm.',
@@ -796,6 +874,13 @@ function doPointsTransfer(req, res, body) {
   if (!Number.isFinite(amount) || amount <= 0) {
     return err(res, 400, 'so_diem_khong_hop_le', 'Số điểm chuyển phải là số nguyên dương.');
   }
+  // Đối tác KHÔNG chuyển điểm được (tài khoản tạm, chỉ để test/trải nghiệm).
+  // Kiểm bên gửi trước cả streak (luật cứng, không phụ thuộc số ngày online).
+  if (a.user.partner) {
+    return err(res, 403, 'doi_tac_khong_chuyen_diem',
+      'Tài khoản đối tác (tạm, chỉ để test/trải nghiệm) không chuyển điểm được.',
+      { doi_tac: 'nguoi_gui' });
+  }
   // Điều kiện mở chuyển: online liên tiếp 30 ngày (tính đến hôm nay).
   const streak = activeStreak(a.user);
   if (streak < POINTS_TRANSFER_MIN_STREAK_DAYS) {
@@ -806,6 +891,13 @@ function doPointsTransfer(req, res, body) {
   const recipient = findTransferRecipient(a.users, to);
   if (!recipient) {
     return err(res, 404, 'khong_tim_thay_nguoi_nhan', 'Không tìm thấy tài khoản nhận điểm.');
+  }
+  // Đối tác cũng KHÔNG NHẬN điểm chuyển (kiểm sau streak theo đúng thứ tự
+  // hợp đồng chuyển điểm: streak → tra người nhận → kiểm đối tác).
+  if (recipient.partner) {
+    return err(res, 403, 'doi_tac_khong_chuyen_diem',
+      'Không chuyển điểm cho tài khoản đối tác (tài khoản tạm, chỉ để test/trải nghiệm).',
+      { doi_tac: 'nguoi_nhan' });
   }
   if (recipient.id === a.user.id) {
     return err(res, 400, 'khong_chuyen_cho_chinh_minh', 'Không chuyển điểm cho chính mình.');
@@ -840,6 +932,7 @@ function doPointsStatus(req, res) {
   return json(res, 200, {
     ok: true,
     balance: Math.max(0, Math.floor(Number(a.user.balance) || 0)),
+    partner: !!a.user.partner,
     streak: streak,
     transfer_unlocked: unlocked,
     days_left: unlocked ? 0 : (POINTS_TRANSFER_MIN_STREAK_DAYS - streak),
@@ -952,6 +1045,8 @@ function adminUserSummary(u) {
     last_login_at: u.last_login_at || 0,
     locked: !!u.admin_locked,
     lock_reason: u.admin_lock_reason || null,
+    partner: !!u.partner,
+    active_locks: activeLocks(u), // khóa tính năng đang còn hiệu lực (đã hết hạn tự hết)
   };
 }
 
@@ -996,9 +1091,15 @@ function doAdminUserDetail(req, res) {
       character_updated_at: c.updated_at || 0,
       failed_attempts: u.failed_attempts || 0,
       temp_locked_until: u.locked_until || 0,
+      feature_locks: u.feature_locks || {},
     }),
     ledger: store.ledgerForUser(u.id, 20),
     admin_log: store.adminLogForUser(u.id, 20),
+    // Lịch sử vi phạm + đối tác của tài khoản (mới nhất trước).
+    violations: store.adminLogForUser(u.id, 50).filter((e) => e && (
+      e.action === 'violation_lock' || e.action === 'violation_unlock' ||
+      e.action === 'violation_deduct' || e.action === 'partner_set' ||
+      e.action === 'partner_unset' || e.action === 'partner_create')),
   });
 }
 
@@ -1158,6 +1259,254 @@ function doAdminPoints(req, res, body) {
     before: before, after: after, reason: reason,
   });
   return json(res, 200, { ok: true, user: adminUserSummary(u) });
+}
+
+// ---------- Đối tác + Vi phạm (admin) ----------
+// POST /auth/admin/user/partner-create {email?, phone?, password, name?}
+// Tạo tài khoản ĐỐI TÁC mới (tạm, chỉ để test/trải nghiệm hệ thống): số dư
+// mặc định PARTNER_DEFAULT_BALANCE (1000) điểm, ghi sổ cái. Admin tự giữ
+// mật khẩu đã đặt để đưa cho đối tác. Không chịu rate-limit đăng ký thường.
+async function doAdminPartnerCreate(req, res, body) {
+  if (!adminGuard(req, res)) return;
+  let email = String(body.email || '').trim().toLowerCase() || null;
+  let phone = body.phone != null ? store.normalizePhone(body.phone) : null;
+  const password = String(body.password || '');
+  if (body.phone != null && !phone) {
+    return err(res, 400, 'so_dien_thoai_khong_hop_le', 'Số điện thoại chưa đúng (đầu 09/03/07/08/05, 10 số).');
+  }
+  if (!email && !phone) {
+    return err(res, 400, 'thieu_thong_tin', 'Cần email hoặc số điện thoại để tạo tài khoản đối tác.');
+  }
+  if (email && !store.validEmail(email)) {
+    return err(res, 400, 'email_khong_hop_le', 'Email chưa đúng định dạng.');
+  }
+  if (password.length < 8 || password.length > 72) {
+    return err(res, 400, 'mat_khau_yeu', 'Mật khẩu tối thiểu 8 ký tự.');
+  }
+  const users = store.loadUsers();
+  if (email && store.findByEmail(users, email)) {
+    return err(res, 409, 'email_ton_tai', 'Email này đã có tài khoản.');
+  }
+  if (phone && store.findByPhone(users, phone)) {
+    return err(res, 409, 'so_dien_thoai_ton_tai', 'Số điện thoại này đã có tài khoản.');
+  }
+  let charName = sanitizeCharName(body.name);
+  if (!charName) charName = store.randomCharacterName(users);
+  else if (store.characterNameTaken(users, charName)) {
+    return err(res, 409, 'ten_nhan_vat_ton_tai', 'Tên nhân vật này đã có người dùng.');
+  }
+  const password_hash = await bcrypt.hash(password, BCRYPT_COST);
+  const id = store.newUserId();
+  const now = Date.now();
+  users[id] = {
+    id: id,
+    email: email,
+    phone: phone,
+    password_hash: password_hash,
+    character: {
+      name: charName, merit: 0, level: 1, level_name: 'Phật tử mới',
+      phapDanh: null, avatar: 'unlock-1',
+      updated_at: now, renamed_count: 0,
+    },
+    balance: PARTNER_DEFAULT_BALANCE,
+    partner: true, // tài khoản đối tác (tạm): dùng điểm như thường, không chuyển điểm — dùng xong admin xoá
+    created_at: now,
+    last_login_at: 0,
+    failed_attempts: 0,
+    locked_until: 0,
+  };
+  store.saveUsers(users);
+  store.appendLedger({
+    user_id: id, type: 'tang', amount: PARTNER_DEFAULT_BALANCE,
+    balance_after: PARTNER_DEFAULT_BALANCE,
+    reason: 'Tạo tài khoản đối tác +' + PARTNER_DEFAULT_BALANCE + ' điểm', at: now,
+  });
+  store.appendAdminLog({
+    action: 'partner_create', user_id: id, target: charName,
+    detail: 'Tạo tài khoản đối tác (tạm, để test/trải nghiệm) — số dư mặc định ' + PARTNER_DEFAULT_BALANCE + ' điểm',
+    after: { partner: true, balance: PARTNER_DEFAULT_BALANCE },
+  });
+  return json(res, 201, { ok: true, user: adminUserSummary(users[id]) });
+}
+
+// POST /auth/admin/user/partner {user_id, partner} — bật/tắt cờ đối tác.
+// Bật đối tác cho tài khoản có sẵn: nếu số dư < 1000 thì nâng lên 1000 (ghi
+// sổ cái phần chênh lệch); số dư đã ≥1000 thì giữ nguyên. Tắt đối tác: giữ
+// nguyên số dư. Tài khoản thường vẫn KHÔNG được xoá vĩnh viễn.
+function doAdminPartner(req, res, body) {
+  if (!adminGuard(req, res)) return;
+  const userId = String(body.user_id || '');
+  const partner = body.partner === true;
+  const users = store.loadUsers();
+  const u = users[userId];
+  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  const before = { partner: !!u.partner, balance: u.balance || 0 };
+  if (before.partner === partner) {
+    return json(res, 200, { ok: true, partner: partner, changed: false, user: adminUserSummary(u) });
+  }
+  u.partner = partner;
+  let toppedUp = 0;
+  if (partner && (u.balance || 0) < PARTNER_DEFAULT_BALANCE) {
+    toppedUp = PARTNER_DEFAULT_BALANCE - (u.balance || 0);
+    u.balance = PARTNER_DEFAULT_BALANCE;
+    // Ghi sổ cái trực tiếp (addBalance nạp lại file riêng sẽ ghi đè cờ partner).
+    store.appendLedger({
+      user_id: userId, type: 'tang', amount: toppedUp, balance_after: u.balance,
+      reason: 'Nâng số dư lên ' + PARTNER_DEFAULT_BALANCE + ' điểm (tài khoản đối tác)', at: Date.now(),
+    });
+  }
+  store.saveUsers(users);
+  store.appendAdminLog({
+    action: partner ? 'partner_set' : 'partner_unset', user_id: userId,
+    target: (u.character && u.character.name) || userId,
+    detail: partner
+      ? 'Bật tài khoản đối tác (tạm, dùng điểm như thường; không chuyển điểm)' + (toppedUp > 0 ? ', nâng số dư +' + toppedUp + ' điểm lên ' + PARTNER_DEFAULT_BALANCE : '')
+      : 'Tắt tài khoản đối tác (dùng điểm như tài khoản thường)',
+    before: before, after: { partner: partner, balance: u.balance || 0 },
+  });
+  return json(res, 200, { ok: true, partner: partner, changed: true, topped_up: toppedUp, user: adminUserSummary(u) });
+}
+
+// POST /auth/admin/user/violation-lock {user_id, action: 'lock'|'unlock',
+//   features: [...], duration?: 'forever'|'1d'|'7d'|'30d', reason?}
+// Khóa 1 hoặc nhiều tính năng (hoặc '*' = tất cả). Khóa cần lý do bắt buộc.
+// Mở khóa sớm: action 'unlock', không cần lý do. Khóa hết hạn tự hết hiệu
+// lực theo thời gian (không cần cron dọn). Mọi thao tác ghi nhật ký admin.
+function doAdminViolationLock(req, res, body) {
+  if (!adminGuard(req, res)) return;
+  const userId = String(body.user_id || '');
+  const action = String(body.action || 'lock').trim().toLowerCase();
+  const featuresRaw = Array.isArray(body.features) ? body.features : [];
+  const duration = String(body.duration || 'forever').trim().toLowerCase();
+  const reason = String(body.reason || '').trim().slice(0, 200);
+  if (action !== 'lock' && action !== 'unlock') {
+    return err(res, 400, 'hanh_dong_khong_hop_le', 'Hành động phải là lock hoặc unlock.');
+  }
+  const features = [];
+  for (const f of featuresRaw) {
+    const s = String(f || '').trim().toLowerCase();
+    if (LOCKABLE_FEATURES.indexOf(s) >= 0 && features.indexOf(s) < 0) features.push(s);
+  }
+  if (features.length === 0) {
+    return err(res, 400, 'thieu_tinh_nang', 'Chọn ít nhất 1 tính năng để khóa/mở khóa.');
+  }
+  if (action === 'lock') {
+    if (!reason) return err(res, 400, 'thieu_ly_do', 'Khóa tính năng cần nhập lý do.');
+    if (LOCK_DURATIONS[duration] === undefined) {
+      return err(res, 400, 'thoi_han_khong_hop_le', 'Thời hạn phải là forever, 1d, 7d hoặc 30d.');
+    }
+  }
+  const users = store.loadUsers();
+  const u = users[userId];
+  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  const now = Date.now();
+  if (!u.feature_locks || typeof u.feature_locks !== 'object') u.feature_locks = {};
+  const before = activeLocks(u);
+  const labels = features.map(featureLabel);
+  if (action === 'lock') {
+    const expiresAt = LOCK_DURATIONS[duration] === 0 ? 0 : now + LOCK_DURATIONS[duration];
+    for (const f of features) {
+      u.feature_locks[f] = { reason: reason, expires_at: expiresAt, by: 'admin', at: now };
+    }
+    store.saveUsers(users);
+    store.appendAdminLog({
+      action: 'violation_lock', user_id: userId,
+      target: (u.character && u.character.name) || userId,
+      detail: 'Khóa tính năng: ' + labels.join(', ') + ' — ' + LOCK_DURATION_LABELS[duration],
+      before: before, after: activeLocks(u), reason: reason,
+    });
+  } else {
+    for (const f of features) delete u.feature_locks[f];
+    store.saveUsers(users);
+    store.appendAdminLog({
+      action: 'violation_unlock', user_id: userId,
+      target: (u.character && u.character.name) || userId,
+      detail: 'Mở khóa sớm tính năng: ' + labels.join(', '),
+      before: before, after: activeLocks(u), reason: reason || undefined,
+    });
+  }
+  return json(res, 200, { ok: true, action: action, user: adminUserSummary(u) });
+}
+
+// POST /auth/admin/user/violation-deduct {user_id, amount, reason}
+// Trừ điểm do vi phạm: số điểm > 0, số dư không xuống dưới 0, ghi sổ cái
+// với lý do. Lý do bắt buộc.
+function doAdminViolationDeduct(req, res, body) {
+  if (!adminGuard(req, res)) return;
+  const userId = String(body.user_id || '');
+  const amount = Math.floor(Number(body.amount));
+  const reason = String(body.reason || '').trim().slice(0, 200);
+  if (!reason) return err(res, 400, 'thieu_ly_do', 'Trừ điểm do vi phạm cần nhập lý do.');
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 100000) {
+    return err(res, 400, 'so_diem_khong_hop_le', 'Số điểm trừ phải từ 1 đến 100000.');
+  }
+  const users = store.loadUsers();
+  const u = users[userId];
+  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  const before = u.balance || 0;
+  if (before < amount) {
+    return err(res, 400, 'xu_khong_du', 'Tài khoản chỉ còn ' + before + ' điểm, không trừ được ' + amount + ' điểm.');
+  }
+  const after = store.addBalance(userId, -amount, 'tieu', '[Vi phạm] Trừ ' + amount + ' điểm: ' + reason);
+  if (after === null) {
+    return err(res, 400, 'xu_khong_du', 'Không trừ được điểm (số dư không đủ).');
+  }
+  store.appendAdminLog({
+    action: 'violation_deduct', user_id: userId,
+    target: (u.character && u.character.name) || userId,
+    detail: 'Trừ điểm do vi phạm: -' + amount + ' điểm',
+    before: { balance: before }, after: { balance: after }, reason: reason,
+  });
+  const users2 = store.loadUsers();
+  return json(res, 200, { ok: true, deducted: amount, balance: after, user: adminUserSummary(users2[userId]) });
+}
+
+// POST /auth/admin/user/delete-partner {user_id}
+// Xoá tài khoản ĐỐI TÁC (tạm, dùng xong thì xoá). CHỈ đối tác mới xoá được —
+// tài khoản thường vẫn giữ nguyên tắc không xoá vĩnh viễn.
+// Xoá: hồ sơ + số dư + lịch sử sổ cái + phiên đăng nhập + token đặt lại MK
+// của tài khoản đó. Nhật ký admin GIỮ LẠI (là bằng chứng kiểm toán), và ghi
+// thêm 1 dòng 'partner_delete' ghi rõ đã xoá đối tác nào, lúc nào.
+function doAdminDeletePartner(req, res, body) {
+  if (!adminGuard(req, res)) return;
+  const userId = String(body.user_id || '');
+  const users = store.loadUsers();
+  const u = users[userId];
+  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  if (!u.partner) {
+    return err(res, 400, 'chi_xoa_duoc_doi_tac', 'Chỉ tài khoản đối tác mới được xoá. Tài khoản thường không xoá vĩnh viễn.');
+  }
+  const targetName = (u.character && u.character.name) || userId;
+  const targetContact = u.email || u.phone || '';
+  const hadBalance = u.balance || 0;
+  delete users[userId];
+  store.saveUsers(users);
+  // Xoá phiên đăng nhập của tài khoản này.
+  const sessions = store.loadSessions();
+  let sessRemoved = 0;
+  for (const k of Object.keys(sessions)) {
+    if (sessions[k] && sessions[k].user_id === userId) { delete sessions[k]; sessRemoved++; }
+  }
+  if (sessRemoved > 0) store.saveSessions(sessions);
+  // Xoá token đặt lại mật khẩu của tài khoản này.
+  const resets = store.loadResets();
+  let resetsRemoved = 0;
+  for (const k of Object.keys(resets)) {
+    if (resets[k] && resets[k].user_id === userId) { delete resets[k]; resetsRemoved++; }
+  }
+  if (resetsRemoved > 0) store.saveResets(resets);
+  // Xoá lịch sử sổ cái của tài khoản này.
+  const ledger = store.loadLedger();
+  const kept = Array.isArray(ledger) ? ledger.filter((e) => !e || e.user_id !== userId) : [];
+  const ledgerRemoved = (Array.isArray(ledger) ? ledger.length : 0) - kept.length;
+  if (ledgerRemoved > 0) store.writeJson(store.DATA_DIR + '/ledger.db', kept);
+  store.appendAdminLog({
+    action: 'partner_delete', user_id: userId, target: targetName,
+    detail: 'Xoá tài khoản đối tác ' + targetName + (targetContact ? ' (' + targetContact + ')' : '') +
+      ' — đã xoá hồ sơ + số dư ' + hadBalance + ' điểm + ' + ledgerRemoved + ' dòng sổ cái + ' + sessRemoved + ' phiên đăng nhập',
+    before: { partner: true, balance: hadBalance }, after: { deleted: true },
+  });
+  return json(res, 200, { ok: true, deleted: true, target: targetName, ledger_removed: ledgerRemoved });
 }
 
 // GET /auth/admin/log?limit=&action= — nhật ký thao tác admin (mới nhất trước).
