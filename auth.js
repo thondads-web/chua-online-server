@@ -402,7 +402,7 @@ async function doForgot(req, res, body) {
   const out = Object.assign({}, generic);
   if (!sent.sent && sent.dev) {
     // Chế độ dev (chưa cấu hình email): báo rõ, token CHỈ nằm trong server log.
-    out.dev_note = 'Email chưa cấu hình (thiếu BREVO_API_KEY hoặc RESEND_API_KEY) — link đặt lại đã ghi vào server log, chưa gửi email thật.';
+    out.dev_note = 'Email chưa cấu hình (thiếu BREVO_API_KEY, RESEND_API_KEY hoặc GMAIL_APP_PASSWORD) — link đặt lại đã ghi vào server log, chưa gửi email thật.';
   }
   return json(res, 200, out);
 }
