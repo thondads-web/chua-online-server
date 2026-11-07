@@ -217,6 +217,54 @@ function adminLogForUser(userId, limit) {
   return loadAdminLog().filter((e) => e && e.user_id === userId).slice(-(limit || 50)).reverse();
 }
 
+// ---------- Lịch sử hoạt động tài khoản (append-only, tối đa 10.000 dòng) ----------
+// Thọ giao 08/11/2026 — để mọi lỗi tài khoản đều truy vết được (đăng nhập sai,
+// 401 khi dùng dịch vụ, khóa tạm...). Cùng mẫu sổ cái điểm (appendLedger).
+// Entry: { user_id, ident, action, result: 'ok'|'fail', code, ip, ua, detail, at }
+// - user_id: id tài khoản khi xác định được (null nếu chưa biết, vd đăng nhập
+//   sai bằng email lạ). ident: email (lowercase) hoặc SĐT chuẩn hoá — để admin
+//   tìm theo email/SĐT. KHÔNG ghi mật khẩu, token, session.
+// - KHÔNG ghi /auth/me thành công (trang nào cũng gọi) — chỉ ghi /me khi có
+//   cookie phiên gửi kèm nhưng không hợp lệ (xem doMe trong auth.js).
+const ACTIVITY_FILE = path.join(DATA_DIR, 'activity.db');
+const ACTIVITY_MAX = 10000;
+function loadActivity() {
+  const v = readJson(ACTIVITY_FILE, []);
+  return Array.isArray(v) ? v : [];
+}
+function addActivity(entry) {
+  const e = Object.assign({}, entry || {});
+  e.user_id = e.user_id || null;
+  e.ident = (e.ident != null && e.ident !== '') ? String(e.ident).slice(0, 120) : null;
+  e.action = String(e.action || '').slice(0, 60);
+  e.result = e.result === 'ok' ? 'ok' : 'fail';
+  e.code = String(e.code || '').slice(0, 60);
+  e.ip = String(e.ip || '').slice(0, 60);
+  e.ua = String(e.ua || '').slice(0, 200);
+  e.detail = String(e.detail || '').slice(0, 200);
+  e.at = Number(e.at) || Date.now();
+  const l = loadActivity();
+  l.push(e);
+  const trimmed = l.length > ACTIVITY_MAX ? l.slice(l.length - ACTIVITY_MAX) : l;
+  writeJson(ACTIVITY_FILE, trimmed);
+  return e;
+}
+function activityForUser(userId, limit) {
+  return loadActivity().filter((e) => e && e.user_id === userId).slice(-(limit || 100)).reverse();
+}
+// Lịch sử mới nhất trước; filter: {user_id, ident, action, result, code, since}
+function recentActivity(limit, filter) {
+  const f = filter || {};
+  let l = loadActivity();
+  if (f.user_id) l = l.filter((e) => e && e.user_id === f.user_id);
+  if (f.ident) l = l.filter((e) => e && e.ident === f.ident);
+  if (f.action) l = l.filter((e) => e && e.action === f.action);
+  if (f.result) l = l.filter((e) => e && e.result === f.result);
+  if (f.code) l = l.filter((e) => e && e.code === f.code);
+  if (f.since) l = l.filter((e) => e && (e.at || 0) >= f.since);
+  return l.slice(-(limit || 100)).reverse();
+}
+
 // ---------- Cấu hình vận hành web (admin chỉnh qua trang quản trị) ----------
 const DEFAULT_CONFIG = {
   game_enabled: true,
@@ -315,6 +363,7 @@ module.exports = {
   AVATAR_UNLOCKS, avatarImageForId,
   validEmail, normalizePhone, newUserId,
   loadAdminLog, appendAdminLog, adminLogForUser,
+  loadActivity, addActivity, activityForUser, recentActivity,
   DEFAULT_CONFIG, loadConfig, saveConfig,
   loadHidden, saveHidden,
   loadReview, saveReview,

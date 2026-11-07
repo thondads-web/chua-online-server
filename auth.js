@@ -121,6 +121,30 @@ function clientIp(req) {
   const fwd = req.headers['x-forwarded-for'];
   return (typeof fwd === 'string' ? fwd.split(',')[0] : '').trim() || req.socket.remoteAddress || 'unknown';
 }
+
+// ---------- Lịch sử hoạt động tài khoản (Thọ giao 08/11/2026) ----------
+// Ghi append-only vào data/activity.db qua store.addActivity — để mọi lỗi tài
+// khoản đều truy vết được (đăng nhập sai, 401 khi dùng dịch vụ, khóa tạm...).
+// KHÔNG ghi mật khẩu/token/session. Ghi log lỗi không được làm hỏng request chính.
+function logAct(req, userId, ident, action, result, code, detail) {
+  try {
+    store.addActivity({
+      user_id: userId || null,
+      ident: ident || null,
+      action: action,
+      result: result,
+      code: code || '',
+      ip: clientIp(req),
+      ua: String(req.headers['user-agent'] || '').slice(0, 200),
+      detail: detail || '',
+    });
+  } catch (e) { /* bỏ qua — log lỗi không chặn request */ }
+}
+// Che ident giống maskEmail/maskPhone (để trả cho admin UI).
+function maskIdent(ident) {
+  if (!ident) return null;
+  return String(ident).indexOf('@') >= 0 ? maskEmail(ident) : maskPhone(ident);
+}
 function getSessionToken(req) {
   const h = req.headers.cookie || '';
   const m = h.match(/(?:^|;\s*)session=([^;]+)/);
@@ -285,6 +309,9 @@ async function handleAuth(req, res) {
     if (route === '/admin/user/violation-lock' && req.method === 'POST') return doAdminViolationLock(req, res, body);
     if (route === '/admin/user/violation-deduct' && req.method === 'POST') return doAdminViolationDeduct(req, res, body);
     if (route === '/admin/user/delete-partner' && req.method === 'POST') return doAdminDeletePartner(req, res, body);
+    if (route === '/admin/activity' && req.method === 'GET') return doAdminActivity(req, res);
+    if (route === '/admin/activity/errors' && req.method === 'GET') return doAdminActivityErrors(req, res);
+    if (route === '/admin/user/reset-temp-lock' && req.method === 'POST') return doAdminResetTempLock(req, res, body);
     if (route === '/admin/log' && req.method === 'GET') return doAdminLog(req, res);
   } catch (e) {
     console.log('[auth] lỗi: ' + (e && e.message));
@@ -297,30 +324,36 @@ async function handleAuth(req, res) {
 async function doRegister(req, res, body) {
   const ip = clientIp(req);
   const rlS = rateLimited('reg:ip:' + ip, 3, 3600 * 1000);
-  if (rlS) { res.setHeader('Retry-After', rlS); return err(res, 429, 'qua_nhieu_yeu_cau', 'Thí chủ thao tác quá nhanh, thử lại sau ' + rlS + ' giây.'); }
+  if (rlS) { res.setHeader('Retry-After', rlS); logAct(req, null, null, 'register', 'fail', 'qua_nhieu_yeu_cau', 'Đăng ký quá nhanh từ IP này'); return err(res, 429, 'qua_nhieu_yeu_cau', 'Thí chủ thao tác quá nhanh, thử lại sau ' + rlS + ' giây.'); }
 
   let email = String(body.email || '').trim().toLowerCase() || null;
   let phone = body.phone != null ? store.normalizePhone(body.phone) : null;
   const password = String(body.password || '');
 
   if (body.phone != null && !phone) {
+    logAct(req, null, String(body.phone || '').slice(0, 50), 'register', 'fail', 'so_dien_thoai_khong_hop_le', '');
     return err(res, 400, 'so_dien_thoai_khong_hop_le', 'Số điện thoại chưa đúng (đầu 09/03/07/08/05, 10 số).');
   }
   if (!email && !phone) {
+    logAct(req, null, null, 'register', 'fail', 'thieu_thong_tin', '');
     return err(res, 400, 'thieu_thong_tin', 'Cần email hoặc số điện thoại để đăng ký.');
   }
   if (email && !store.validEmail(email)) {
+    logAct(req, null, email, 'register', 'fail', 'email_khong_hop_le', '');
     return err(res, 400, 'email_khong_hop_le', 'Email chưa đúng định dạng.');
   }
   if (password.length < 8 || password.length > 72) {
+    logAct(req, null, email || phone, 'register', 'fail', 'mat_khau_yeu', '');
     return err(res, 400, 'mat_khau_yeu', 'Mật khẩu tối thiểu 8 ký tự.');
   }
 
   const users = store.loadUsers();
   if (email && store.findByEmail(users, email)) {
+    logAct(req, null, email, 'register', 'fail', 'email_ton_tai', '');
     return err(res, 409, 'email_ton_tai', 'Email này đã có tài khoản.');
   }
   if (phone && store.findByPhone(users, phone)) {
+    logAct(req, null, phone, 'register', 'fail', 'so_dien_thoai_ton_tai', '');
     return err(res, 409, 'so_dien_thoai_ton_tai', 'Số điện thoại này đã có tài khoản.');
   }
 
@@ -328,6 +361,7 @@ async function doRegister(req, res, body) {
   let charName = sanitizeCharName(body.name);
   if (!charName) charName = store.randomCharacterName(users);
   else if (store.characterNameTaken(users, charName)) {
+    logAct(req, null, email || phone, 'register', 'fail', 'ten_nhan_vat_ton_tai', 'Tên nhân vật đã có người dùng: ' + charName);
     return err(res, 409, 'ten_nhan_vat_ton_tai', 'Tên nhân vật này đã có người dùng.');
   }
 
@@ -357,6 +391,7 @@ async function doRegister(req, res, body) {
 
   const token = createSession(users, id, req);
   setSessionCookie(res, token);
+  logAct(req, id, email || phone, 'register', 'ok', '', 'Tạo tài khoản thành công +100 điểm');
   return json(res, 201, { ok: true, user: publicUser(users[id]) });
 }
 
@@ -364,26 +399,29 @@ async function doRegister(req, res, body) {
 async function doLogin(req, res, body) {
   const ip = clientIp(req);
   let rlS = rateLimited('login:ip:' + ip, 5, 15 * 60 * 1000);
-  if (rlS) { res.setHeader('Retry-After', rlS); return err(res, 429, 'qua_nhieu_yeu_cau', 'Thí chủ thử quá nhiều lần, nghỉ ' + rlS + ' giây rồi thử lại.'); }
+  if (rlS) { res.setHeader('Retry-After', rlS); logAct(req, null, null, 'login', 'fail', 'qua_nhieu_yeu_cau', 'Đăng nhập quá nhanh từ IP này'); return err(res, 429, 'qua_nhieu_yeu_cau', 'Thí chủ thử quá nhiều lần, nghỉ ' + rlS + ' giây rồi thử lại.'); }
 
   let email = String(body.email || '').trim().toLowerCase() || null;
   let phone = body.phone != null ? store.normalizePhone(body.phone) : null;
   const password = String(body.password || '');
   if (!email && !phone) {
+    logAct(req, null, null, 'login', 'fail', 'thieu_thong_tin', '');
     return err(res, 400, 'thieu_thong_tin', 'Cần email hoặc số điện thoại để đăng nhập.');
   }
   if (!password) {
+    logAct(req, null, email || phone, 'login', 'fail', 'thieu_thong_tin', 'Thiếu mật khẩu');
     return err(res, 400, 'thieu_thong_tin', 'Thiếu mật khẩu.');
   }
   const identKey = 'login:id:' + (email || phone);
   rlS = rateLimited(identKey, 10, 3600 * 1000);
-  if (rlS) { res.setHeader('Retry-After', rlS); return err(res, 429, 'qua_nhieu_yeu_cau', 'Thử lại sau ' + rlS + ' giây.'); }
+  if (rlS) { res.setHeader('Retry-After', rlS); logAct(req, null, email || phone, 'login', 'fail', 'qua_nhieu_yeu_cau', 'Đăng nhập sai quá nhiều cho tài khoản này'); return err(res, 429, 'qua_nhieu_yeu_cau', 'Thử lại sau ' + rlS + ' giây.'); }
 
   const users = store.loadUsers();
   const user = email ? store.findByEmail(users, email) : store.findByPhone(users, phone);
   const now = Date.now();
   // Tài khoản bị admin khóa thì không đăng nhập được (mở khóa lại được).
   if (user && user.admin_locked) {
+    logAct(req, user.id, email || phone, 'login', 'fail', 'tai_khoan_bi_khoa', 'Tài khoản bị admin khóa');
     return err(res, 423, 'tai_khoan_bi_khoa',
       'Tài khoản này đã bị khóa bởi quản trị. Thí chủ liên hệ hỗ trợ để mở lại.');
   }
@@ -391,6 +429,7 @@ async function doLogin(req, res, body) {
   if (user && user.locked_until && user.locked_until > now) {
     const retry = Math.ceil((user.locked_until - now) / 1000);
     res.setHeader('Retry-After', retry);
+    logAct(req, user.id, email || phone, 'login', 'fail', 'tai_khoan_tam_khoa', 'Còn khóa tạm ' + Math.ceil(retry / 60) + ' phút');
     return err(res, 423, 'tai_khoan_tam_khoa',
       'Tài khoản tạm khóa vì nhập sai nhiều lần. Thử lại sau ' + Math.ceil(retry / 60) + ' phút.',
       { retry_after_giay: retry });
@@ -400,14 +439,18 @@ async function doLogin(req, res, body) {
     try { ok = await bcrypt.compare(password, user.password_hash); } catch (e) { ok = false; }
   }
   if (!user || !ok) {
+    let lockedNow = false;
     if (user) {
       user.failed_attempts = (user.failed_attempts || 0) + 1;
       if (user.failed_attempts >= LOCK_AFTER_FAILS) {
         user.locked_until = now + LOCK_MS;
         user.failed_attempts = 0;
+        lockedNow = true;
       }
       store.saveUsers(users);
     }
+    logAct(req, user ? user.id : null, email || phone, 'login', 'fail', 'sai_thong_tin',
+      user ? (lockedNow ? 'Sai lần thứ 5 — đã khóa tạm 15 phút' : 'Sai mật khẩu (lần sai thứ ' + (user.failed_attempts || 0) + ')') : 'Không tìm thấy tài khoản');
     return err(res, 401, 'sai_thong_tin', 'Email/số điện thoại hoặc mật khẩu chưa đúng.');
   }
   user.failed_attempts = 0;
@@ -419,16 +462,22 @@ async function doLogin(req, res, body) {
   const token = createSession(users, user.id, req);
   setSessionCookie(res, token);
   store.syncMeritFromGame(user);
+  logAct(req, user.id, email || phone, 'login', 'ok', '', '');
   return json(res, 200, { ok: true, user: publicUser(user) });
 }
 
 // ---------- POST /auth/logout ----------
 function doLogout(req, res) {
   const token = getSessionToken(req);
+  let uid = null;
   if (token) {
     const sessions = store.loadSessions();
     const key = store.sha256hex(token);
-    if (sessions[key]) { delete sessions[key]; store.saveSessions(sessions); }
+    if (sessions[key]) { uid = sessions[key].user_id || null; delete sessions[key]; store.saveSessions(sessions); }
+  }
+  if (uid) {
+    const u = store.findById(store.loadUsers(), uid);
+    logAct(req, uid, u ? (u.email || u.phone) : null, 'logout', 'ok', '', '');
   }
   clearSessionCookie(res);
   return json(res, 200, { ok: true });
@@ -437,7 +486,12 @@ function doLogout(req, res) {
 // ---------- GET /auth/me ----------
 function doMe(req, res) {
   const a = getAuthUser(req);
-  if (!a) return json(res, 200, { logged_in: false });
+  if (!a) {
+    // CHỈ ghi khi có cookie phiên gửi kèm nhưng không hợp lệ/hết hạn — phân
+    // biệt với khách chưa đăng nhập (không có cookie thì không ghi).
+    if (getSessionToken(req)) logAct(req, null, null, 'me', 'fail', 'phien_khong_hop_le', 'Cookie phiên không hợp lệ/hết hạn');
+    return json(res, 200, { logged_in: false });
+  }
   const users = a.users;
   recordActiveDay(a.user); // ghi ngày online hôm nay (Asia/Saigon)
   store.saveUsers(users); // lưu merit đã đồng bộ (nếu có)
@@ -449,25 +503,34 @@ async function doForgot(req, res, body) {
   let email = String(body.email || '').trim().toLowerCase() || null;
   let phone = body.phone != null ? store.normalizePhone(body.phone) : null;
   if (body.phone != null && !phone) {
+    logAct(req, null, String(body.phone || '').slice(0, 50), 'forgot-password', 'fail', 'so_dien_thoai_khong_hop_le', '');
     return err(res, 400, 'so_dien_thoai_khong_hop_le', 'Số điện thoại chưa đúng định dạng.');
   }
   if (email && !store.validEmail(email)) {
+    logAct(req, null, email, 'forgot-password', 'fail', 'email_khong_hop_le', '');
     return err(res, 400, 'email_khong_hop_le', 'Email chưa đúng định dạng.');
   }
   if (!email && !phone) {
+    logAct(req, null, null, 'forgot-password', 'fail', 'thieu_thong_tin', '');
     return err(res, 400, 'thieu_thong_tin', 'Cần email hoặc số điện thoại.');
   }
   const ident = email || phone;
   const rlS = rateLimited('forgot:' + ident, 3, 3600 * 1000);
-  if (rlS) { res.setHeader('Retry-After', rlS); return err(res, 429, 'qua_nhieu_yeu_cau', 'Thử lại sau ' + rlS + ' giây.'); }
+  if (rlS) { res.setHeader('Retry-After', rlS); logAct(req, null, ident, 'forgot-password', 'fail', 'qua_nhieu_yeu_cau', ''); return err(res, 429, 'qua_nhieu_yeu_cau', 'Thử lại sau ' + rlS + ' giây.'); }
 
   const generic = { ok: true, message: 'Nếu thông tin tồn tại, hướng dẫn đặt lại đã được gửi.' };
   const users = store.loadUsers();
   const user = email ? store.findByEmail(users, email) : store.findByPhone(users, phone);
-  if (!user) return json(res, 200, generic); // luôn 200 — chống dò tài khoản
+  if (!user) {
+    // Ghi ok (không phải lỗi): trả generic chống dò tài khoản; admin vẫn
+    // truy vết được là có người yêu cầu đặt lại cho tài khoản không tồn tại.
+    logAct(req, null, ident, 'forgot-password', 'ok', '', 'Tài khoản không tồn tại — trả thông báo chung');
+    return json(res, 200, generic); // luôn 200 — chống dò tài khoản
+  }
 
   // Tài khoản SĐT: chưa có SMS gateway → hướng dẫn liên hệ hỗ trợ.
   if (!user.email) {
+    logAct(req, user.id, ident, 'forgot-password', 'ok', '', 'Tài khoản SĐT — hướng dẫn liên hệ hỗ trợ');
     return json(res, 200, {
       ok: true,
       message: 'Tài khoản đăng ký bằng số điện thoại — vui lòng liên hệ hỗ trợ để lấy lại mật khẩu.',
@@ -488,6 +551,7 @@ async function doForgot(req, res, body) {
     // Chế độ dev (chưa cấu hình email): báo rõ, token CHỈ nằm trong server log.
     out.dev_note = 'Email chưa cấu hình (thiếu BREVO_API_KEY, RESEND_API_KEY hoặc GMAIL_APP_PASSWORD) — link đặt lại đã ghi vào server log, chưa gửi email thật.';
   }
+  logAct(req, user.id, user.email, 'forgot-password', 'ok', '', sent.sent ? 'Email đặt lại đã gửi' : 'Chưa cấu hình email (dev mode) — chưa gửi email thật');
   return json(res, 200, out);
 }
 
@@ -497,23 +561,29 @@ async function doReset(req, res, body) {
   const newPw = String(body.new_password || '');
   if (!token || newPw.length < 8 || newPw.length > 72) {
     if (newPw && (newPw.length < 8 || newPw.length > 72)) {
+      logAct(req, null, null, 'reset-password', 'fail', 'mat_khau_yeu', '');
       return err(res, 400, 'mat_khau_yeu', 'Mật khẩu tối thiểu 8 ký tự.');
     }
+    logAct(req, null, null, 'reset-password', 'fail', 'token_khong_hop_le', 'Thiếu token');
     return err(res, 400, 'token_khong_hop_le', 'Link đặt lại không hợp lệ hoặc đã hết hạn.');
   }
   const key = store.sha256hex(token);
   const rlS = rateLimited('reset:' + key, 10, 3600 * 1000);
-  if (rlS) { res.setHeader('Retry-After', rlS); return err(res, 429, 'qua_nhieu_yeu_cau', 'Thử lại sau ' + rlS + ' giây.'); }
+  if (rlS) { res.setHeader('Retry-After', rlS); logAct(req, null, null, 'reset-password', 'fail', 'qua_nhieu_yeu_cau', ''); return err(res, 429, 'qua_nhieu_yeu_cau', 'Thử lại sau ' + rlS + ' giây.'); }
 
   const resets = store.loadResets();
   const r = resets[key];
   // 1 mã lỗi chung cho mọi trường hợp token sai/hết hạn/đã dùng.
   if (!r || r.used || !r.expires_at || r.expires_at <= Date.now()) {
+    logAct(req, r ? r.user_id : null, null, 'reset-password', 'fail', 'token_khong_hop_le', !r ? 'Token không tồn tại' : (r.used ? 'Token đã dùng' : 'Token hết hạn'));
     return err(res, 400, 'token_khong_hop_le', 'Link đặt lại không hợp lệ hoặc đã hết hạn.');
   }
   const users = store.loadUsers();
   const user = store.findById(users, r.user_id);
-  if (!user) return err(res, 400, 'token_khong_hop_le', 'Link đặt lại không hợp lệ hoặc đã hết hạn.');
+  if (!user) {
+    logAct(req, r.user_id, null, 'reset-password', 'fail', 'token_khong_hop_le', 'Không tìm thấy tài khoản theo token');
+    return err(res, 400, 'token_khong_hop_le', 'Link đặt lại không hợp lệ hoặc đã hết hạn.');
+  }
 
   user.password_hash = await bcrypt.hash(newPw, BCRYPT_COST);
   user.failed_attempts = 0;
@@ -524,6 +594,7 @@ async function doReset(req, res, body) {
   // Xóa toàn bộ session cũ — mọi thiết bị phải đăng nhập lại.
   destroyUserSessions(user.id, null);
 
+  logAct(req, user.id, user.email || user.phone, 'reset-password', 'ok', '', 'Đổi mật khẩu + xóa toàn bộ phiên');
   return json(res, 200, { ok: true, message: 'Đổi mật khẩu thành công. Vui lòng đăng nhập lại.' });
 }
 
@@ -658,9 +729,10 @@ const XP_COOLDOWN_MS = 30 * 1000;
 const XP_HOURLY_CAP = 50;
 async function doEarn(req, res, body) {
   const a = getAuthUser(req);
-  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  if (!a) { logAct(req, null, null, 'earn', 'fail', 'chua_dang_nhap', ''); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   const service = String(body.service || '').trim().slice(0, 50);
   if (!/^[a-z0-9_-]{1,50}$/i.test(service)) {
+    logAct(req, null, null, 'earn', 'fail', 'dich_vu_khong_hop_le', 'Tên dịch vụ: ' + service);
     return err(res, 400, 'dich_vu_khong_hop_le', 'Tên dịch vụ chưa đúng.');
   }
   const users = a.users;
@@ -669,6 +741,7 @@ async function doEarn(req, res, body) {
   // Chống spam: 30 giây mới cộng 1 lần (theo tài khoản).
   const lastAt = Math.floor(Number(user.xp_last_at) || 0);
   if (now - lastAt < XP_COOLDOWN_MS) {
+    logAct(req, user.id, user.email || user.phone, 'earn', 'fail', 'cong_diem_qua_nhanh', 'Dịch vụ: ' + service);
     return err(res, 429, 'cong_diem_qua_nhanh',
       'Thí chủ thao tác quá nhanh, thử lại sau ' + Math.ceil((XP_COOLDOWN_MS - (now - lastAt)) / 1000) + ' giây.',
       { retry_after_giay: Math.ceil((XP_COOLDOWN_MS - (now - lastAt)) / 1000) });
@@ -677,6 +750,7 @@ async function doEarn(req, res, body) {
   const rlS = rateLimited('earn:user:' + user.id, XP_HOURLY_CAP, 3600 * 1000);
   if (rlS) {
     res.setHeader('Retry-After', rlS);
+    logAct(req, user.id, user.email || user.phone, 'earn', 'fail', 'qua_nhieu_yeu_cau', 'Dịch vụ: ' + service);
     return err(res, 429, 'qua_nhieu_yeu_cau', 'Thí chủ đã nhận đủ điểm trong giờ này, thử lại sau.');
   }
   const c = user.character;
@@ -690,6 +764,7 @@ async function doEarn(req, res, body) {
   c.updated_at = now;
   user.xp_last_at = now;
   store.saveUsers(users);
+  logAct(req, user.id, user.email || user.phone, 'earn', 'ok', '', 'Dùng công cụ ' + service + ' +10 công đức');
   return json(res, 200, {
     ok: true,
     xp_gained: XP_PER_USE,
@@ -729,21 +804,24 @@ function pointsEarnedToday(userId, kind) {
 // POST /auth/points/use {service} — trừ 20 điểm để dùng 1 dịch vụ.
 function doPointsUse(req, res, body) {
   const a = getAuthUser(req);
-  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  if (!a) { logAct(req, null, null, 'points/use', 'fail', 'chua_dang_nhap', 'Dịch vụ: ' + String(body.service || '')); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   const service = String(body.service || '').trim().slice(0, 50);
   if (!validServiceName(service)) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/use', 'fail', 'dich_vu_khong_hop_le', 'Tên dịch vụ: ' + service);
     return err(res, 400, 'dich_vu_khong_hop_le', 'Tên dịch vụ chưa đúng.');
   }
   const balance = Math.max(0, Math.floor(Number(a.user.balance) || 0));
   // Vi phạm: tính năng bị khóa thì chặn TRƯỚC cả kiểm tra điểm (đối tác cũng bị chặn).
   const lock = getActiveLock(a.user, service);
   if (lock) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/use', 'fail', 'tinh_nang_bi_khoa', 'Dịch vụ: ' + service + ' — ' + (lock.reason || ''));
     return err(res, 403, 'tinh_nang_bi_khoa',
       'Tính năng ' + featureLabel(service) + ' đang tạm khóa' + (lock.expires_at ? ' đến ' + new Date(lock.expires_at).toLocaleDateString('vi-VN') : ' vĩnh viễn') + '.',
       { feature: service, reason: lock.reason, expires_at: lock.expires_at || 0 });
   }
   // Đối tác dùng điểm NHƯ tài khoản thường (−20/lần, trừ từ số dư 1000) — KHÔNG bypass (Thọ đơn giản hoá 21:47).
   if (balance < POINTS_USE_COST) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/use', 'fail', 'khong_du_diem', 'Dịch vụ: ' + service + ' — còn ' + balance + ' điểm');
     return err(res, 402, 'khong_du_diem',
       'Thí chủ còn ' + balance + ' điểm, dùng dịch vụ này cần ' + POINTS_USE_COST + ' điểm.',
       { balance: balance });
@@ -751,56 +829,67 @@ function doPointsUse(req, res, body) {
   // Kiểm tra số dư + trừ trong cùng một lượt xử lý, không có await xen giữa.
   const after = store.addBalance(a.user.id, -POINTS_USE_COST, 'tieu', 'Dùng dịch vụ ' + service + ' -20 điểm');
   if (after === null) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/use', 'fail', 'khong_du_diem', 'Dịch vụ: ' + service);
     return err(res, 402, 'khong_du_diem', 'Thí chủ không đủ điểm để dùng dịch vụ này.', { balance: balance });
   }
+  logAct(req, a.user.id, a.user.email || a.user.phone, 'points/use', 'ok', '', 'Dùng dịch vụ ' + service + ' -20 điểm (còn ' + after + ')');
   return json(res, 200, { ok: true, balance: after });
 }
 
 // POST /auth/points/view {article} — trừ 50 điểm để xem 1 bài chuyên sâu.
 function doPointsView(req, res, body) {
   const a = getAuthUser(req);
-  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  if (!a) { logAct(req, null, null, 'points/view', 'fail', 'chua_dang_nhap', 'Bài: ' + String(body.article || '')); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   const article = String(body.article || '').trim().slice(0, 50);
   if (!validServiceName(article)) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/view', 'fail', 'bai_viet_khong_hop_le', 'Bài: ' + article);
     return err(res, 400, 'bai_viet_khong_hop_le', 'Tên bài viết chưa đúng.');
   }
   const balance = Math.max(0, Math.floor(Number(a.user.balance) || 0));
   // Vi phạm: mục chuyên sâu bị khóa thì chặn trước (đối tác cũng bị chặn).
   const lock = getActiveLock(a.user, 'xem-chuyen-sau');
   if (lock) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/view', 'fail', 'tinh_nang_bi_khoa', 'Bài: ' + article + ' — ' + (lock.reason || ''));
     return err(res, 403, 'tinh_nang_bi_khoa',
       'Tính năng ' + featureLabel('xem-chuyen-sau') + ' đang tạm khóa' + (lock.expires_at ? ' đến ' + new Date(lock.expires_at).toLocaleDateString('vi-VN') : ' vĩnh viễn') + '.',
       { feature: 'xem-chuyen-sau', reason: lock.reason, expires_at: lock.expires_at || 0 });
   }
   // Đối tác dùng điểm NHƯ tài khoản thường (−50/lần, trừ từ số dư 1000) — KHÔNG bypass (Thọ đơn giản hoá 21:47).
   if (balance < POINTS_VIEW_COST) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/view', 'fail', 'khong_du_diem', 'Bài: ' + article + ' — còn ' + balance + ' điểm');
     return err(res, 402, 'khong_du_diem',
       'Thí chủ còn ' + balance + ' điểm, xem bài chuyên sâu cần ' + POINTS_VIEW_COST + ' điểm.',
       { balance: balance });
   }
   const after = store.addBalance(a.user.id, -POINTS_VIEW_COST, 'tieu', 'Xem chuyên sâu ' + article + ' -50 điểm');
   if (after === null) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/view', 'fail', 'khong_du_diem', 'Bài: ' + article);
     return err(res, 402, 'khong_du_diem', 'Thí chủ không đủ điểm để xem bài này.', { balance: balance });
   }
+  logAct(req, a.user.id, a.user.email || a.user.phone, 'points/view', 'ok', '', 'Xem chuyên sâu ' + article + ' -50 điểm (còn ' + after + ')');
   return json(res, 200, { ok: true, balance: after });
 }
 
 // POST /auth/points/earn {kind} — cộng điểm tương tác, mỗi loại 1 lần/ngày.
 function doPointsEarn(req, res, body) {
   const a = getAuthUser(req);
-  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  if (!a) { logAct(req, null, null, 'points/earn', 'fail', 'chua_dang_nhap', 'Loại: ' + String(body.kind || '')); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   const kind = String(body.kind || '').trim().toLowerCase();
   if (!Object.prototype.hasOwnProperty.call(POINTS_EARN, kind)) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/earn', 'fail', 'loai_tuong_tac_khong_hop_le', 'Loại: ' + kind);
     return err(res, 400, 'loai_tuong_tac_khong_hop_le', 'Loại tương tác phải là comment, like hoặc share.');
   }
   if (pointsEarnedToday(a.user.id, kind)) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/earn', 'fail', 'het_luot_hom_nay', 'Loại: ' + kind);
     return err(res, 429, 'het_luot_hom_nay', 'Thí chủ đã nhận điểm ' + kind + ' hôm nay rồi, mai quay lại nhé.', { kind: kind });
   }
   const gained = POINTS_EARN[kind];
   const after = store.addBalance(a.user.id, gained, 'tang', 'Tương tác ' + kind + ' +' + gained + ' điểm');
   if (after === null) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/earn', 'fail', 'loi_he_thong', 'Loại: ' + kind);
     return err(res, 500, 'loi_he_thong', 'Hệ thống bận, thí chủ thử lại sau.');
   }
+  logAct(req, a.user.id, a.user.email || a.user.phone, 'points/earn', 'ok', '', 'Tương tác ' + kind + ' +' + gained + ' điểm (còn ' + after + ')');
   return json(res, 200, { ok: true, gained: gained, balance: after });
 }
 
@@ -865,18 +954,21 @@ function transferLabel(u) {
 // POST /auth/points/transfer {to, amount} — chuyển điểm cho tài khoản khác.
 function doPointsTransfer(req, res, body) {
   const a = getAuthUser(req);
-  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  if (!a) { logAct(req, null, null, 'points/transfer', 'fail', 'chua_dang_nhap', 'Chuyển cho: ' + String(body.to || '')); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   const to = String(body.to || '').trim().slice(0, 100);
   const amount = Math.floor(Number(body.amount));
   if (!to) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'fail', 'thieu_nguoi_nhan', '');
     return err(res, 400, 'thieu_nguoi_nhan', 'Thí chủ chưa nhập tài khoản nhận điểm.');
   }
   if (!Number.isFinite(amount) || amount <= 0) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'fail', 'so_diem_khong_hop_le', 'Chuyển cho: ' + to);
     return err(res, 400, 'so_diem_khong_hop_le', 'Số điểm chuyển phải là số nguyên dương.');
   }
   // Đối tác KHÔNG chuyển điểm được (tài khoản tạm, chỉ để test/trải nghiệm).
   // Kiểm bên gửi trước cả streak (luật cứng, không phụ thuộc số ngày online).
   if (a.user.partner) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'fail', 'doi_tac_khong_chuyen_diem', 'Người gửi là đối tác — chuyển cho: ' + to + ' ' + amount + ' điểm');
     return err(res, 403, 'doi_tac_khong_chuyen_diem',
       'Tài khoản đối tác (tạm, chỉ để test/trải nghiệm) không chuyển điểm được.',
       { doi_tac: 'nguoi_gui' });
@@ -884,26 +976,31 @@ function doPointsTransfer(req, res, body) {
   // Điều kiện mở chuyển: online liên tiếp 30 ngày (tính đến hôm nay).
   const streak = activeStreak(a.user);
   if (streak < POINTS_TRANSFER_MIN_STREAK_DAYS) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'fail', 'chua_du_30_ngay', 'Chuyển cho: ' + to + ' ' + amount + ' điểm — streak ' + streak + ' ngày');
     return err(res, 403, 'chua_du_30_ngay',
       'Thí chủ cần online liên tiếp 30 ngày mới chuyển được điểm. Hiện tại đã liên tiếp ' + streak + ' ngày.',
       { streak: streak, con_thieu: POINTS_TRANSFER_MIN_STREAK_DAYS - streak });
   }
   const recipient = findTransferRecipient(a.users, to);
   if (!recipient) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'fail', 'khong_tim_thay_nguoi_nhan', 'Chuyển cho: ' + to + ' ' + amount + ' điểm');
     return err(res, 404, 'khong_tim_thay_nguoi_nhan', 'Không tìm thấy tài khoản nhận điểm.');
   }
   // Đối tác cũng KHÔNG NHẬN điểm chuyển (kiểm sau streak theo đúng thứ tự
   // hợp đồng chuyển điểm: streak → tra người nhận → kiểm đối tác).
   if (recipient.partner) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'fail', 'doi_tac_khong_chuyen_diem', 'Người nhận là đối tác — ' + transferLabel(recipient) + ' ' + amount + ' điểm');
     return err(res, 403, 'doi_tac_khong_chuyen_diem',
       'Không chuyển điểm cho tài khoản đối tác (tài khoản tạm, chỉ để test/trải nghiệm).',
       { doi_tac: 'nguoi_nhan' });
   }
   if (recipient.id === a.user.id) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'fail', 'khong_chuyen_cho_chinh_minh', amount + ' điểm');
     return err(res, 400, 'khong_chuyen_cho_chinh_minh', 'Không chuyển điểm cho chính mình.');
   }
   const balance = Math.max(0, Math.floor(Number(a.user.balance) || 0));
   if (balance < amount) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'fail', 'khong_du_diem', 'Chuyển cho: ' + transferLabel(recipient) + ' ' + amount + ' điểm — còn ' + balance);
     return err(res, 402, 'khong_du_diem',
       'Thí chủ còn ' + balance + ' điểm, không đủ để chuyển ' + amount + ' điểm.',
       { balance: balance });
@@ -912,14 +1009,17 @@ function doPointsTransfer(req, res, body) {
   const recvLabel = transferLabel(recipient);
   const after = store.addBalance(a.user.id, -amount, 'tieu', 'Chuyển điểm cho ' + recvLabel + ' -' + amount + ' điểm');
   if (after === null) {
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'fail', 'khong_du_diem', 'Chuyển cho: ' + recvLabel + ' ' + amount + ' điểm');
     return err(res, 402, 'khong_du_diem', 'Thí chủ không đủ điểm để chuyển.', { balance: balance });
   }
   const recvAfter = store.addBalance(recipient.id, amount, 'tang', 'Nhận điểm từ ' + transferLabel(a.user) + ' +' + amount + ' điểm');
   if (recvAfter === null) {
     // Hiếm: cộng cho người nhận lỗi sau khi đã trừ người gửi → hoàn lại.
     store.addBalance(a.user.id, amount, 'tang', 'Hoàn điểm do chuyển cho ' + recvLabel + ' lỗi');
+    logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'fail', 'loi_he_thong', 'Chuyển cho: ' + recvLabel + ' ' + amount + ' điểm — đã hoàn lại');
     return err(res, 500, 'loi_he_thong', 'Hệ thống bận, thí chủ thử lại sau.');
   }
+  logAct(req, a.user.id, a.user.email || a.user.phone, 'points/transfer', 'ok', '', 'Chuyển cho ' + recvLabel + ' ' + amount + ' điểm (còn ' + after + ')');
   return json(res, 200, { ok: true, balance: after, streak: streak, to_name: recvLabel });
 }
 
@@ -1112,9 +1212,13 @@ function doAdminUserLock(req, res, body) {
   const reason = String(body.reason || '').trim().slice(0, 200);
   const users = store.loadUsers();
   const u = users[userId];
-  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  if (!u) {
+    logAct(req, userId, null, locked ? 'admin_lock' : 'admin_unlock', 'fail', 'khong_tim_thay', '');
+    return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  }
   const before = !!u.admin_locked;
   if (before === locked) {
+    logAct(req, userId, u.email || u.phone, locked ? 'admin_lock' : 'admin_unlock', 'ok', '', 'Đã ở trạng thái này — không đổi');
     return json(res, 200, { ok: true, locked: locked, changed: false, user: adminUserSummary(u) });
   }
   u.admin_locked = locked;
@@ -1135,6 +1239,7 @@ function doAdminUserLock(req, res, body) {
     detail: locked ? 'Khóa tài khoản' : 'Mở khóa tài khoản',
     before: before, after: locked, reason: reason,
   });
+  logAct(req, userId, u.email || u.phone, locked ? 'admin_lock' : 'admin_unlock', 'ok', '', (locked ? 'Khóa tài khoản' : 'Mở khóa tài khoản') + (reason ? ' — ' + reason : ''));
   return json(res, 200, { ok: true, locked: locked, changed: true, user: adminUserSummary(u) });
 }
 
@@ -1214,20 +1319,23 @@ function doAdminPoints(req, res, body) {
   const reason = String(body.reason || '').trim();
   const meritDelta = Number(body.merit_delta) || 0;
   const xuDelta = Number(body.xu_delta) || 0;
-  if (!reason) return err(res, 400, 'thieu_ly_do', 'Cần nhập lý do cộng/trừ điểm.');
-  if (reason.length > 200) return err(res, 400, 'ly_do_quai_dai', 'Lý do tối đa 200 ký tự.');
+  if (!reason) { logAct(req, userId || null, null, 'admin_points', 'fail', 'thieu_ly_do', ''); return err(res, 400, 'thieu_ly_do', 'Cần nhập lý do cộng/trừ điểm.'); }
+  if (reason.length > 200) { logAct(req, userId || null, null, 'admin_points', 'fail', 'ly_do_quai_dai', ''); return err(res, 400, 'ly_do_quai_dai', 'Lý do tối đa 200 ký tự.'); }
   if (!Number.isInteger(meritDelta) || Math.abs(meritDelta) > 10000) {
+    logAct(req, userId || null, null, 'admin_points', 'fail', 'diem_khong_hop_le', '');
     return err(res, 400, 'diem_khong_hop_le', 'Điểm công đức mỗi lần từ -10000 đến 10000.');
   }
   if (!Number.isInteger(xuDelta) || Math.abs(xuDelta) > 100000) {
+    logAct(req, userId || null, null, 'admin_points', 'fail', 'xu_khong_hop_le', '');
     return err(res, 400, 'xu_khong_hop_le', 'Xu mỗi lần từ -100000 đến 100000.');
   }
   if (meritDelta === 0 && xuDelta === 0) {
+    logAct(req, userId || null, null, 'admin_points', 'fail', 'khong_co_gi_thay_doi', '');
     return err(res, 400, 'khong_co_gi_thay_doi', 'Điểm và xu đều bằng 0 — không có gì để cập nhật.');
   }
   const users = store.loadUsers();
   const u = users[userId];
-  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  if (!u) { logAct(req, userId, null, 'admin_points', 'fail', 'khong_tim_thay', ''); return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.'); }
   const c = u.character || {};
   const before = { merit: c.merit || 0, level: c.level || 1, level_name: c.level_name || 'Phật tử mới', balance: u.balance || 0 };
   if (meritDelta !== 0) {
@@ -1240,6 +1348,7 @@ function doAdminPoints(req, res, body) {
   }
   if (xuDelta !== 0) {
     if (xuDelta < 0 && (u.balance || 0) + xuDelta < 0) {
+      logAct(req, userId, u.email || u.phone, 'admin_points', 'fail', 'xu_khong_du', 'Trừ ' + Math.abs(xuDelta) + ' xu — còn ' + (u.balance || 0) + ' xu');
       return err(res, 400, 'xu_khong_du', 'Số xu hiện có không đủ để trừ ' + Math.abs(xuDelta) + ' xu.');
     }
     // Cộng/trừ xu trực tiếp trên bản users đang giữ (addBalance nạp lại file
@@ -1258,6 +1367,7 @@ function doAdminPoints(req, res, body) {
       ', xu ' + (xuDelta >= 0 ? '+' : '') + xuDelta,
     before: before, after: after, reason: reason,
   });
+  logAct(req, userId, u.email || u.phone, 'admin_points', 'ok', '', 'Admin điều chỉnh: công đức ' + (meritDelta >= 0 ? '+' : '') + meritDelta + ', xu ' + (xuDelta >= 0 ? '+' : '') + xuDelta + ' — ' + reason);
   return json(res, 200, { ok: true, user: adminUserSummary(u) });
 }
 
@@ -1272,27 +1382,34 @@ async function doAdminPartnerCreate(req, res, body) {
   let phone = body.phone != null ? store.normalizePhone(body.phone) : null;
   const password = String(body.password || '');
   if (body.phone != null && !phone) {
+    logAct(req, null, String(body.phone || '').slice(0, 50), 'partner_create', 'fail', 'so_dien_thoai_khong_hop_le', '');
     return err(res, 400, 'so_dien_thoai_khong_hop_le', 'Số điện thoại chưa đúng (đầu 09/03/07/08/05, 10 số).');
   }
   if (!email && !phone) {
+    logAct(req, null, null, 'partner_create', 'fail', 'thieu_thong_tin', '');
     return err(res, 400, 'thieu_thong_tin', 'Cần email hoặc số điện thoại để tạo tài khoản đối tác.');
   }
   if (email && !store.validEmail(email)) {
+    logAct(req, null, email, 'partner_create', 'fail', 'email_khong_hop_le', '');
     return err(res, 400, 'email_khong_hop_le', 'Email chưa đúng định dạng.');
   }
   if (password.length < 8 || password.length > 72) {
+    logAct(req, null, email || phone, 'partner_create', 'fail', 'mat_khau_yeu', '');
     return err(res, 400, 'mat_khau_yeu', 'Mật khẩu tối thiểu 8 ký tự.');
   }
   const users = store.loadUsers();
   if (email && store.findByEmail(users, email)) {
+    logAct(req, null, email, 'partner_create', 'fail', 'email_ton_tai', '');
     return err(res, 409, 'email_ton_tai', 'Email này đã có tài khoản.');
   }
   if (phone && store.findByPhone(users, phone)) {
+    logAct(req, null, phone, 'partner_create', 'fail', 'so_dien_thoai_ton_tai', '');
     return err(res, 409, 'so_dien_thoai_ton_tai', 'Số điện thoại này đã có tài khoản.');
   }
   let charName = sanitizeCharName(body.name);
   if (!charName) charName = store.randomCharacterName(users);
   else if (store.characterNameTaken(users, charName)) {
+    logAct(req, null, email || phone, 'partner_create', 'fail', 'ten_nhan_vat_ton_tai', 'Tên nhân vật: ' + charName);
     return err(res, 409, 'ten_nhan_vat_ton_tai', 'Tên nhân vật này đã có người dùng.');
   }
   const password_hash = await bcrypt.hash(password, BCRYPT_COST);
@@ -1326,6 +1443,7 @@ async function doAdminPartnerCreate(req, res, body) {
     detail: 'Tạo tài khoản đối tác (tạm, để test/trải nghiệm) — số dư mặc định ' + PARTNER_DEFAULT_BALANCE + ' điểm',
     after: { partner: true, balance: PARTNER_DEFAULT_BALANCE },
   });
+  logAct(req, id, email || phone, 'partner_create', 'ok', '', 'Tạo tài khoản đối tác ' + charName + ' +' + PARTNER_DEFAULT_BALANCE + ' điểm');
   return json(res, 201, { ok: true, user: adminUserSummary(users[id]) });
 }
 
@@ -1339,9 +1457,10 @@ function doAdminPartner(req, res, body) {
   const partner = body.partner === true;
   const users = store.loadUsers();
   const u = users[userId];
-  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  if (!u) { logAct(req, userId, null, partner ? 'partner_set' : 'partner_unset', 'fail', 'khong_tim_thay', ''); return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.'); }
   const before = { partner: !!u.partner, balance: u.balance || 0 };
   if (before.partner === partner) {
+    logAct(req, userId, u.email || u.phone, partner ? 'partner_set' : 'partner_unset', 'ok', '', 'Đã ở trạng thái này — không đổi');
     return json(res, 200, { ok: true, partner: partner, changed: false, user: adminUserSummary(u) });
   }
   u.partner = partner;
@@ -1364,6 +1483,7 @@ function doAdminPartner(req, res, body) {
       : 'Tắt tài khoản đối tác (dùng điểm như tài khoản thường)',
     before: before, after: { partner: partner, balance: u.balance || 0 },
   });
+  logAct(req, userId, u.email || u.phone, partner ? 'partner_set' : 'partner_unset', 'ok', '', partner ? 'Bật đối tác' + (toppedUp > 0 ? ', nâng số dư +' + toppedUp + ' điểm' : '') : 'Tắt đối tác');
   return json(res, 200, { ok: true, partner: partner, changed: true, topped_up: toppedUp, user: adminUserSummary(u) });
 }
 
@@ -1380,6 +1500,7 @@ function doAdminViolationLock(req, res, body) {
   const duration = String(body.duration || 'forever').trim().toLowerCase();
   const reason = String(body.reason || '').trim().slice(0, 200);
   if (action !== 'lock' && action !== 'unlock') {
+    logAct(req, userId, null, 'violation_lock', 'fail', 'hanh_dong_khong_hop_le', 'Hành động: ' + action);
     return err(res, 400, 'hanh_dong_khong_hop_le', 'Hành động phải là lock hoặc unlock.');
   }
   const features = [];
@@ -1388,17 +1509,19 @@ function doAdminViolationLock(req, res, body) {
     if (LOCKABLE_FEATURES.indexOf(s) >= 0 && features.indexOf(s) < 0) features.push(s);
   }
   if (features.length === 0) {
+    logAct(req, userId, null, 'violation_lock', 'fail', 'thieu_tinh_nang', '');
     return err(res, 400, 'thieu_tinh_nang', 'Chọn ít nhất 1 tính năng để khóa/mở khóa.');
   }
   if (action === 'lock') {
-    if (!reason) return err(res, 400, 'thieu_ly_do', 'Khóa tính năng cần nhập lý do.');
+    if (!reason) { logAct(req, userId, null, 'violation_lock', 'fail', 'thieu_ly_do', 'Tính năng: ' + features.join(',')); return err(res, 400, 'thieu_ly_do', 'Khóa tính năng cần nhập lý do.'); }
     if (LOCK_DURATIONS[duration] === undefined) {
+      logAct(req, userId, null, 'violation_lock', 'fail', 'thoi_han_khong_hop_le', 'Thời hạn: ' + duration);
       return err(res, 400, 'thoi_han_khong_hop_le', 'Thời hạn phải là forever, 1d, 7d hoặc 30d.');
     }
   }
   const users = store.loadUsers();
   const u = users[userId];
-  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  if (!u) { logAct(req, userId, null, action === 'lock' ? 'violation_lock' : 'violation_unlock', 'fail', 'khong_tim_thay', ''); return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.'); }
   const now = Date.now();
   if (!u.feature_locks || typeof u.feature_locks !== 'object') u.feature_locks = {};
   const before = activeLocks(u);
@@ -1415,6 +1538,7 @@ function doAdminViolationLock(req, res, body) {
       detail: 'Khóa tính năng: ' + labels.join(', ') + ' — ' + LOCK_DURATION_LABELS[duration],
       before: before, after: activeLocks(u), reason: reason,
     });
+    logAct(req, userId, u.email || u.phone, 'violation_lock', 'ok', '', 'Khóa tính năng: ' + labels.join(', ') + ' — ' + LOCK_DURATION_LABELS[duration] + ' — ' + reason);
   } else {
     for (const f of features) delete u.feature_locks[f];
     store.saveUsers(users);
@@ -1424,6 +1548,7 @@ function doAdminViolationLock(req, res, body) {
       detail: 'Mở khóa sớm tính năng: ' + labels.join(', '),
       before: before, after: activeLocks(u), reason: reason || undefined,
     });
+    logAct(req, userId, u.email || u.phone, 'violation_unlock', 'ok', '', 'Mở khóa sớm tính năng: ' + labels.join(', '));
   }
   return json(res, 200, { ok: true, action: action, user: adminUserSummary(u) });
 }
@@ -1436,19 +1561,22 @@ function doAdminViolationDeduct(req, res, body) {
   const userId = String(body.user_id || '');
   const amount = Math.floor(Number(body.amount));
   const reason = String(body.reason || '').trim().slice(0, 200);
-  if (!reason) return err(res, 400, 'thieu_ly_do', 'Trừ điểm do vi phạm cần nhập lý do.');
+  if (!reason) { logAct(req, userId || null, null, 'violation_deduct', 'fail', 'thieu_ly_do', ''); return err(res, 400, 'thieu_ly_do', 'Trừ điểm do vi phạm cần nhập lý do.'); }
   if (!Number.isFinite(amount) || amount <= 0 || amount > 100000) {
+    logAct(req, userId || null, null, 'violation_deduct', 'fail', 'so_diem_khong_hop_le', 'Số điểm: ' + String(body.amount));
     return err(res, 400, 'so_diem_khong_hop_le', 'Số điểm trừ phải từ 1 đến 100000.');
   }
   const users = store.loadUsers();
   const u = users[userId];
-  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  if (!u) { logAct(req, userId, null, 'violation_deduct', 'fail', 'khong_tim_thay', ''); return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.'); }
   const before = u.balance || 0;
   if (before < amount) {
+    logAct(req, userId, u.email || u.phone, 'violation_deduct', 'fail', 'xu_khong_du', 'Trừ ' + amount + ' điểm — còn ' + before);
     return err(res, 400, 'xu_khong_du', 'Tài khoản chỉ còn ' + before + ' điểm, không trừ được ' + amount + ' điểm.');
   }
   const after = store.addBalance(userId, -amount, 'tieu', '[Vi phạm] Trừ ' + amount + ' điểm: ' + reason);
   if (after === null) {
+    logAct(req, userId, u.email || u.phone, 'violation_deduct', 'fail', 'xu_khong_du', 'Trừ ' + amount + ' điểm');
     return err(res, 400, 'xu_khong_du', 'Không trừ được điểm (số dư không đủ).');
   }
   store.appendAdminLog({
@@ -1457,6 +1585,7 @@ function doAdminViolationDeduct(req, res, body) {
     detail: 'Trừ điểm do vi phạm: -' + amount + ' điểm',
     before: { balance: before }, after: { balance: after }, reason: reason,
   });
+  logAct(req, userId, u.email || u.phone, 'violation_deduct', 'ok', '', 'Trừ điểm do vi phạm: -' + amount + ' điểm (còn ' + after + ') — ' + reason);
   const users2 = store.loadUsers();
   return json(res, 200, { ok: true, deducted: amount, balance: after, user: adminUserSummary(users2[userId]) });
 }
@@ -1472,8 +1601,9 @@ function doAdminDeletePartner(req, res, body) {
   const userId = String(body.user_id || '');
   const users = store.loadUsers();
   const u = users[userId];
-  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  if (!u) { logAct(req, userId, null, 'partner_delete', 'fail', 'khong_tim_thay', ''); return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.'); }
   if (!u.partner) {
+    logAct(req, userId, u.email || u.phone, 'partner_delete', 'fail', 'chi_xoa_duoc_doi_tac', 'Tài khoản thường — không được xoá');
     return err(res, 400, 'chi_xoa_duoc_doi_tac', 'Chỉ tài khoản đối tác mới được xoá. Tài khoản thường không xoá vĩnh viễn.');
   }
   const targetName = (u.character && u.character.name) || userId;
@@ -1506,7 +1636,118 @@ function doAdminDeletePartner(req, res, body) {
       ' — đã xoá hồ sơ + số dư ' + hadBalance + ' điểm + ' + ledgerRemoved + ' dòng sổ cái + ' + sessRemoved + ' phiên đăng nhập',
     before: { partner: true, balance: hadBalance }, after: { deleted: true },
   });
+  // Lịch sử hoạt động GIỮ LẠI (không xoá cùng hồ sơ) — là bằng chứng kiểm toán.
+  logAct(req, userId, targetContact || null, 'partner_delete', 'ok', '', 'Xoá tài khoản đối tác ' + targetName + ' — số dư ' + hadBalance + ' điểm, ' + ledgerRemoved + ' dòng sổ cái, ' + sessRemoved + ' phiên');
   return json(res, 200, { ok: true, deleted: true, target: targetName, ledger_removed: ledgerRemoved });
+}
+
+// ---------- Lịch sử hoạt động tài khoản (admin) — Thọ giao 08/11/2026 ----------
+// Entry trả cho admin: ident che bớt (như adminUserSummary) — không lộ email/SĐT đầy đủ.
+function publicActivity(e) {
+  return {
+    user_id: e.user_id || null,
+    ident: e.ident ? maskIdent(e.ident) : null,
+    action: e.action,
+    result: e.result,
+    code: e.code || '',
+    ip: e.ip || '',
+    ua: e.ua || '',
+    detail: e.detail || '',
+    at: e.at || 0,
+  };
+}
+
+// GET /auth/admin/activity?user=<id|email|sđt>&action=&result=&days=&limit=&offset=
+// Lịch sử hoạt động, mới nhất trước. user= nhận id, email hoặc SĐT; nếu tài
+// khoản chưa tồn tại (đăng nhập sai bằng email lạ) thì lọc theo ident đó.
+function doAdminActivity(req, res) {
+  if (!adminGuard(req, res)) return;
+  let q = {};
+  try { q = new URL(req.url, 'http://localhost').searchParams; } catch (e) {}
+  const userQ = (q.get('user') || '').trim();
+  const action = (q.get('action') || '').trim();
+  const result = (q.get('result') || '').trim().toLowerCase();
+  const days = Math.max(1, Math.min(90, parseInt(q.get('days') || '7', 10) || 7));
+  const limit = Math.max(1, Math.min(200, parseInt(q.get('limit') || '50', 10) || 50));
+  const offset = Math.max(0, parseInt(q.get('offset') || '0', 10) || 0);
+  const since = Date.now() - days * 24 * 3600 * 1000;
+  const users = store.loadUsers();
+  let userId = null, ident = null;
+  if (userQ) {
+    if (userQ.indexOf('@') >= 0) {
+      const u = store.findByEmail(users, userQ.toLowerCase());
+      if (u) { userId = u.id; ident = u.email; } else { ident = userQ.toLowerCase(); }
+    } else {
+      const ph = store.normalizePhone(userQ);
+      if (ph) {
+        const u = store.findByPhone(users, ph);
+        if (u) { userId = u.id; ident = u.phone; } else { ident = ph; }
+      } else if (users[userQ]) {
+        userId = userQ; ident = users[userQ].email || users[userQ].phone || null;
+      } else { ident = userQ; }
+    }
+  }
+  let entries = store.loadActivity();
+  entries = entries.filter((e) => e && (e.at || 0) >= since);
+  if (userId) entries = entries.filter((e) => e.user_id === userId || (ident && e.ident === ident));
+  else if (ident) entries = entries.filter((e) => e.ident === ident);
+  if (action) entries = entries.filter((e) => e.action === action);
+  if (result === 'ok' || result === 'fail') entries = entries.filter((e) => e.result === result);
+  entries.sort((a, b) => (b.at || 0) - (a.at || 0));
+  const total = entries.length;
+  const page = entries.slice(offset, offset + limit).map(publicActivity);
+  return json(res, 200, { ok: true, total: total, limit: limit, offset: offset, entries: page });
+}
+
+// GET /auth/admin/activity/errors?days= — thống kê lỗi: đếm theo mã lỗi,
+// user có lỗi lặp lại nhiều nhất (để admin + cron sửa lỗi chủ động nhìn 1 cái
+// là thấy tài khoản nào đang kẹt).
+function doAdminActivityErrors(req, res) {
+  if (!adminGuard(req, res)) return;
+  let q = {};
+  try { q = new URL(req.url, 'http://localhost').searchParams; } catch (e) {}
+  const days = Math.max(1, Math.min(90, parseInt(q.get('days') || '7', 10) || 7));
+  const since = Date.now() - days * 24 * 3600 * 1000;
+  const entries = store.loadActivity().filter((e) => e && e.result === 'fail' && (e.at || 0) >= since);
+  const byCode = {};
+  const byUser = {};
+  for (const e of entries) {
+    const c = e.code || 'khong_ro_ma';
+    byCode[c] = (byCode[c] || 0) + 1;
+    const key = e.user_id || ('ident:' + (e.ident || 'khong_ro'));
+    if (!byUser[key]) byUser[key] = { user_id: e.user_id || null, ident: e.ident || null, fails: 0, codes: {} };
+    byUser[key].fails += 1;
+    byUser[key].codes[c] = (byUser[key].codes[c] || 0) + 1;
+  }
+  const topUsers = Object.keys(byUser).map((k) => ({
+    user_id: byUser[k].user_id,
+    ident: byUser[k].ident ? maskIdent(byUser[k].ident) : null,
+    fails: byUser[k].fails,
+    codes: byUser[k].codes,
+  })).sort((a, b) => b.fails - a.fails).slice(0, 10);
+  return json(res, 200, { ok: true, days: days, total_errors: entries.length, by_code: byCode, top_users: topUsers });
+}
+
+// POST /auth/admin/user/reset-temp-lock {user_id} — reset khóa TẠM do đăng
+// nhập sai (failed_attempts + locked_until về 0). Cron sửa lỗi chủ động dùng
+// để tự mở khóa cho tài khoản đã hết hạn khóa 15 phút. CHỈ reset khóa tạm —
+// không động admin_locked, không động điểm/sổ cái.
+function doAdminResetTempLock(req, res, body) {
+  if (!adminGuard(req, res)) return;
+  const userId = String(body.user_id || '');
+  const users = store.loadUsers();
+  const u = users[userId];
+  if (!u) return err(res, 404, 'khong_tim_thay', 'Không tìm thấy tài khoản.');
+  const before = { failed_attempts: u.failed_attempts || 0, locked_until: u.locked_until || 0 };
+  u.failed_attempts = 0;
+  u.locked_until = 0;
+  store.saveUsers(users);
+  store.appendAdminLog({
+    action: 'temp_lock_reset', user_id: userId, target: (u.character && u.character.name) || userId,
+    detail: 'Reset khóa tạm do đăng nhập sai (cron sửa lỗi chủ động)', before: before, after: { failed_attempts: 0, locked_until: 0 },
+  });
+  logAct(req, userId, u.email || u.phone, 'temp_lock_reset', 'ok', '', 'Reset failed_attempts + locked_until về 0 (trước: sai ' + before.failed_attempts + ' lần, khóa đến ' + (before.locked_until ? new Date(before.locked_until).toLocaleString('vi-VN') : 'không khóa') + ')');
+  return json(res, 200, { ok: true, user: adminUserSummary(u) });
 }
 
 // GET /auth/admin/log?limit=&action= — nhật ký thao tác admin (mới nhất trước).
