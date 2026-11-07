@@ -19,6 +19,18 @@ const LOCK_AFTER_FAILS = 5;
 const LOCK_MS = 15 * 60 * 1000; // 15 phút
 const RENAME_COST_XU = 100; // stub: đổi tên lần 2+ tốn xu (chưa trừ thật)
 
+// ---------- Hệ thống Điểm (Thọ chốt 07/11/2026) ----------
+// Điểm chính là số dư Xu (user.balance). Kiếm: đăng ký +100, pháp danh/avatar
+// lần đầu +30/mục, comment/like +10/ngày, share +20/ngày. Tiêu: dùng 1 dịch
+// vụ -20, xem chuyên sâu -50. Mọi giao dịch ghi sổ cái (xem spec he-thong-diem).
+const POINTS_USE_COST = 20;
+const POINTS_VIEW_COST = 50;
+const POINTS_REGISTER_BONUS = 100;
+const POINTS_PROFILE_BONUS = 30;
+const POINTS_EARN = { comment: 10, like: 10, share: 20 };
+const POINTS_TRANSFER_MIN_STREAK_DAYS = 30; // chuyển điểm cần online liên tiếp 30 ngày
+const POINTS_ACTIVE_DAYS_KEEP = 45; // giữ tối đa 45 ngày online gần nhất trên user.active_days
+
 // ---------- CORS ----------
 function corsHeaders() {
   return {
@@ -199,6 +211,11 @@ async function handleAuth(req, res) {
     if (route === '/character' && req.method === 'GET') return doCharacterGet(req, res);
     if (route === '/character' && req.method === 'PATCH') return doCharacterPatch(req, res, body);
     if (route === '/earn' && req.method === 'POST') return await doEarn(req, res, body);
+    if (route === '/points/use' && req.method === 'POST') return doPointsUse(req, res, body);
+    if (route === '/points/view' && req.method === 'POST') return doPointsView(req, res, body);
+    if (route === '/points/earn' && req.method === 'POST') return doPointsEarn(req, res, body);
+    if (route === '/points/transfer' && req.method === 'POST') return doPointsTransfer(req, res, body);
+    if (route === '/points/status' && req.method === 'GET') return doPointsStatus(req, res);
     if (route === '/admin/stats' && req.method === 'GET') return doAdminStats(req, res);
     if (route === '/admin/users' && req.method === 'GET') return doAdminUsers(req, res);
     if (route === '/admin/user' && req.method === 'GET') return doAdminUserDetail(req, res);
@@ -272,6 +289,9 @@ async function doRegister(req, res, body) {
     locked_until: 0,
   };
   store.saveUsers(users);
+  // Tặng 100 điểm khi tạo tài khoản thành công (ghi sổ cái).
+  const regBonus = store.addBalance(id, POINTS_REGISTER_BONUS, 'tang', 'Tạo tài khoản thành công +100 điểm');
+  if (regBonus !== null) users[id].balance = regBonus;
 
   const token = createSession(users, id, req);
   setSessionCookie(res, token);
@@ -331,6 +351,7 @@ async function doLogin(req, res, body) {
   user.failed_attempts = 0;
   user.locked_until = 0;
   user.last_login_at = now;
+  recordActiveDay(user); // ghi ngày online hôm nay (Asia/Saigon)
   store.saveUsers(users);
 
   const token = createSession(users, user.id, req);
@@ -356,6 +377,7 @@ function doMe(req, res) {
   const a = getAuthUser(req);
   if (!a) return json(res, 200, { logged_in: false });
   const users = a.users;
+  recordActiveDay(a.user); // ghi ngày online hôm nay (Asia/Saigon)
   store.saveUsers(users); // lưu merit đã đồng bộ (nếu có)
   return json(res, 200, { logged_in: true, user: publicUser(a.user) });
 }
@@ -486,6 +508,8 @@ function doCharacterPatch(req, res, body) {
     return err(res, 400, 'khong_co_gi_thay_doi', 'Không có thông tin nào để cập nhật.');
   }
   let changed = false;
+  let phapDanhBonus = false; // đặt pháp danh lần đầu -> +30 điểm
+  let avatarBonus = false; // đổi avatar lần đầu (khác unlock-1) -> +30 điểm
   // 1) Đổi tên nhân vật (luồng cũ: lần đầu miễn phí, từ lần 2 tốn xu — stub).
   if (hasName) {
     const name = sanitizeCharName(body.name);
@@ -513,6 +537,8 @@ function doCharacterPatch(req, res, body) {
     if (!validPhapDanh(pd)) {
       return err(res, 400, 'phap_danh_khong_hop_le', 'Pháp danh 2–20 ký tự, chỉ chữ, số, khoảng trắng và gạch ngang, không chứa link.');
     }
+    // Lần đầu đặt pháp danh (trước đó chưa có) -> thưởng 30 điểm, chỉ 1 lần.
+    if (!c.phapDanh && !user.points_phapdanh_done) phapDanhBonus = true;
     c.phapDanh = pd;
     changed = true;
   }
@@ -529,12 +555,31 @@ function doCharacterPatch(req, res, body) {
       return err(res, 403, 'avatar_chua_mo_khoa',
         'Ảnh này mở khóa ở cấp ' + needLevel + ', thí chủ đang ở cấp ' + curLevel + '.');
     }
+    // Lần đầu đổi avatar (từ ảnh mặc định unlock-1 sang ảnh khác) -> +30 điểm, chỉ 1 lần.
+    const prevAvatar = c.avatar || 'unlock-1';
+    if (prevAvatar === 'unlock-1' && av !== 'unlock-1' && !user.points_avatar_done) avatarBonus = true;
     c.avatar = av;
     changed = true;
   }
   if (changed) {
     c.updated_at = Date.now();
     store.saveUsers(users);
+    // Thưởng điểm hồ sơ lần đầu (+30/mục). Cộng SAU khi lưu thay đổi nhân vật
+    // (addBalance nạp lại file), rồi lưu lại cờ + số dư mới để không bị ghi đè.
+    // Cờ chỉ đặt khi cộng điểm thành công (không mất thưởng nếu cộng lỗi).
+    let gained = 0;
+    if (phapDanhBonus) {
+      const after = store.addBalance(user.id, POINTS_PROFILE_BONUS, 'tang', 'Đặt pháp danh lần đầu +30 điểm');
+      if (after !== null) { user.balance = after; user.points_phapdanh_done = true; gained += POINTS_PROFILE_BONUS; }
+    }
+    if (avatarBonus) {
+      const after = store.addBalance(user.id, POINTS_PROFILE_BONUS, 'tang', 'Đổi ảnh đại diện lần đầu +30 điểm');
+      if (after !== null) { user.balance = after; user.points_avatar_done = true; gained += POINTS_PROFILE_BONUS; }
+    }
+    if (gained > 0) {
+      store.saveUsers(users);
+      return json(res, 200, { ok: true, character: publicCharacter(c), points_gained: gained, balance: user.balance || 0 });
+    }
   }
   return json(res, 200, { ok: true, character: publicCharacter(c) });
 }
@@ -593,6 +638,211 @@ async function doEarn(req, res, body) {
     prev_level: prevLevel,
     leveled_up: lv.level > prevLevel,
     character: publicCharacter(c),
+  });
+}
+
+// ---------- Hệ thống Điểm: dùng / xem / kiếm ----------
+// Ngày theo giờ Asia/Saigon (UTC+7, không đổi giờ mùa hè).
+function saigonDate(ts) {
+  return new Date(ts + 7 * 3600 * 1000).toISOString().slice(0, 10);
+}
+function validServiceName(s) {
+  return /^[a-z0-9_-]{1,50}$/i.test(s);
+}
+// Đã nhận điểm tương tác loại này trong ngày (giờ Asia/Saigon) chưa?
+// Kiểm tra bằng sổ cái: tìm giao dịch 'tang' có lý do 'Tương tác <kind> ...'.
+function pointsEarnedToday(userId, kind) {
+  const today = saigonDate(Date.now());
+  const prefix = 'Tương tác ' + kind + ' ';
+  const entries = store.loadLedger();
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (!e || e.user_id !== userId) continue;
+    if (e.type === 'tang' && typeof e.reason === 'string' && e.reason.indexOf(prefix) === 0
+      && saigonDate(e.at) === today) return true;
+  }
+  return false;
+}
+
+// POST /auth/points/use {service} — trừ 20 điểm để dùng 1 dịch vụ.
+function doPointsUse(req, res, body) {
+  const a = getAuthUser(req);
+  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  const service = String(body.service || '').trim().slice(0, 50);
+  if (!validServiceName(service)) {
+    return err(res, 400, 'dich_vu_khong_hop_le', 'Tên dịch vụ chưa đúng.');
+  }
+  const balance = Math.max(0, Math.floor(Number(a.user.balance) || 0));
+  if (balance < POINTS_USE_COST) {
+    return err(res, 402, 'khong_du_diem',
+      'Thí chủ còn ' + balance + ' điểm, dùng dịch vụ này cần ' + POINTS_USE_COST + ' điểm.',
+      { balance: balance });
+  }
+  // Kiểm tra số dư + trừ trong cùng một lượt xử lý, không có await xen giữa.
+  const after = store.addBalance(a.user.id, -POINTS_USE_COST, 'tieu', 'Dùng dịch vụ ' + service + ' -20 điểm');
+  if (after === null) {
+    return err(res, 402, 'khong_du_diem', 'Thí chủ không đủ điểm để dùng dịch vụ này.', { balance: balance });
+  }
+  return json(res, 200, { ok: true, balance: after });
+}
+
+// POST /auth/points/view {article} — trừ 50 điểm để xem 1 bài chuyên sâu.
+function doPointsView(req, res, body) {
+  const a = getAuthUser(req);
+  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  const article = String(body.article || '').trim().slice(0, 50);
+  if (!validServiceName(article)) {
+    return err(res, 400, 'bai_viet_khong_hop_le', 'Tên bài viết chưa đúng.');
+  }
+  const balance = Math.max(0, Math.floor(Number(a.user.balance) || 0));
+  if (balance < POINTS_VIEW_COST) {
+    return err(res, 402, 'khong_du_diem',
+      'Thí chủ còn ' + balance + ' điểm, xem bài chuyên sâu cần ' + POINTS_VIEW_COST + ' điểm.',
+      { balance: balance });
+  }
+  const after = store.addBalance(a.user.id, -POINTS_VIEW_COST, 'tieu', 'Xem chuyên sâu ' + article + ' -50 điểm');
+  if (after === null) {
+    return err(res, 402, 'khong_du_diem', 'Thí chủ không đủ điểm để xem bài này.', { balance: balance });
+  }
+  return json(res, 200, { ok: true, balance: after });
+}
+
+// POST /auth/points/earn {kind} — cộng điểm tương tác, mỗi loại 1 lần/ngày.
+function doPointsEarn(req, res, body) {
+  const a = getAuthUser(req);
+  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  const kind = String(body.kind || '').trim().toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(POINTS_EARN, kind)) {
+    return err(res, 400, 'loai_tuong_tac_khong_hop_le', 'Loại tương tác phải là comment, like hoặc share.');
+  }
+  if (pointsEarnedToday(a.user.id, kind)) {
+    return err(res, 429, 'het_luot_hom_nay', 'Thí chủ đã nhận điểm ' + kind + ' hôm nay rồi, mai quay lại nhé.', { kind: kind });
+  }
+  const gained = POINTS_EARN[kind];
+  const after = store.addBalance(a.user.id, gained, 'tang', 'Tương tác ' + kind + ' +' + gained + ' điểm');
+  if (after === null) {
+    return err(res, 500, 'loi_he_thong', 'Hệ thống bận, thí chủ thử lại sau.');
+  }
+  return json(res, 200, { ok: true, gained: gained, balance: after });
+}
+
+// ---------- Chuyển điểm (Thọ chốt 07/11/2026, mục 8 spec) ----------
+// Ghi ngày online hôm nay (Asia/Saigon) vào user.active_days (mảng, tối đa
+// 45 ngày gần nhất, không trùng ngày). Gọi trong doLogin và doMe.
+function recordActiveDay(user) {
+  if (!user) return;
+  const today = saigonDate(Date.now());
+  let days = Array.isArray(user.active_days)
+    ? user.active_days.filter((d) => typeof d === 'string')
+    : [];
+  if (days.indexOf(today) < 0) days.push(today);
+  if (days.length > POINTS_ACTIVE_DAYS_KEEP) days = days.slice(-POINTS_ACTIVE_DAYS_KEEP);
+  user.active_days = days;
+}
+// Chuỗi ngày online liên tiếp tính đến hôm nay. Hôm nay được tính vì người
+// dùng đang online lúc gọi (dù chưa kịp ghi vào active_days).
+function activeStreak(user) {
+  const days = new Set(Array.isArray(user && user.active_days) ? user.active_days : []);
+  const today = saigonDate(Date.now());
+  days.add(today);
+  let streak = 0;
+  let d = new Date(today + 'T00:00:00Z');
+  while (!isNaN(d.getTime())) {
+    const key = d.toISOString().slice(0, 10);
+    if (!days.has(key)) break;
+    streak += 1;
+    d = new Date(d.getTime() - 24 * 3600 * 1000);
+  }
+  return streak;
+}
+// Tìm tài khoản nhận điểm theo thứ tự: email → SĐT → tên nhân vật
+// (tên nhân vật khớp không phân biệt hoa/thường).
+function findTransferRecipient(users, toRaw) {
+  const to = String(toRaw || '').trim();
+  if (!to) return null;
+  if (store.validEmail(to)) {
+    const u = store.findByEmail(users, to.toLowerCase());
+    if (u) return u;
+  }
+  const phone = store.normalizePhone(to);
+  if (phone) {
+    const u = store.findByPhone(users, phone);
+    if (u) return u;
+  }
+  const low = to.toLowerCase();
+  for (const id of Object.keys(users)) {
+    const u = users[id];
+    const name = u && u.character && u.character.name;
+    if (typeof name === 'string' && name.toLowerCase() === low) return u;
+  }
+  return null;
+}
+function transferLabel(u) {
+  if (u && u.character && u.character.name) return u.character.name;
+  if (u && u.email) return u.email;
+  if (u && u.phone) return u.phone;
+  return 'thí chủ';
+}
+
+// POST /auth/points/transfer {to, amount} — chuyển điểm cho tài khoản khác.
+function doPointsTransfer(req, res, body) {
+  const a = getAuthUser(req);
+  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  const to = String(body.to || '').trim().slice(0, 100);
+  const amount = Math.floor(Number(body.amount));
+  if (!to) {
+    return err(res, 400, 'thieu_nguoi_nhan', 'Thí chủ chưa nhập tài khoản nhận điểm.');
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return err(res, 400, 'so_diem_khong_hop_le', 'Số điểm chuyển phải là số nguyên dương.');
+  }
+  // Điều kiện mở chuyển: online liên tiếp 30 ngày (tính đến hôm nay).
+  const streak = activeStreak(a.user);
+  if (streak < POINTS_TRANSFER_MIN_STREAK_DAYS) {
+    return err(res, 403, 'chua_du_30_ngay',
+      'Thí chủ cần online liên tiếp 30 ngày mới chuyển được điểm. Hiện tại đã liên tiếp ' + streak + ' ngày.',
+      { streak: streak, con_thieu: POINTS_TRANSFER_MIN_STREAK_DAYS - streak });
+  }
+  const recipient = findTransferRecipient(a.users, to);
+  if (!recipient) {
+    return err(res, 404, 'khong_tim_thay_nguoi_nhan', 'Không tìm thấy tài khoản nhận điểm.');
+  }
+  if (recipient.id === a.user.id) {
+    return err(res, 400, 'khong_chuyen_cho_chinh_minh', 'Không chuyển điểm cho chính mình.');
+  }
+  const balance = Math.max(0, Math.floor(Number(a.user.balance) || 0));
+  if (balance < amount) {
+    return err(res, 402, 'khong_du_diem',
+      'Thí chủ còn ' + balance + ' điểm, không đủ để chuyển ' + amount + ' điểm.',
+      { balance: balance });
+  }
+  // Kiểm số dư + trừ trong cùng một lượt xử lý, không có await xen giữa.
+  const recvLabel = transferLabel(recipient);
+  const after = store.addBalance(a.user.id, -amount, 'tieu', 'Chuyển điểm cho ' + recvLabel + ' -' + amount + ' điểm');
+  if (after === null) {
+    return err(res, 402, 'khong_du_diem', 'Thí chủ không đủ điểm để chuyển.', { balance: balance });
+  }
+  const recvAfter = store.addBalance(recipient.id, amount, 'tang', 'Nhận điểm từ ' + transferLabel(a.user) + ' +' + amount + ' điểm');
+  if (recvAfter === null) {
+    // Hiếm: cộng cho người nhận lỗi sau khi đã trừ người gửi → hoàn lại.
+    store.addBalance(a.user.id, amount, 'tang', 'Hoàn điểm do chuyển cho ' + recvLabel + ' lỗi');
+    return err(res, 500, 'loi_he_thong', 'Hệ thống bận, thí chủ thử lại sau.');
+  }
+  return json(res, 200, { ok: true, balance: after, streak: streak, to_name: recvLabel });
+}
+
+// GET /auth/points/status — số dư + chuỗi online + trạng thái mở chuyển.
+function doPointsStatus(req, res) {
+  const a = getAuthUser(req);
+  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  const streak = activeStreak(a.user);
+  const unlocked = streak >= POINTS_TRANSFER_MIN_STREAK_DAYS;
+  return json(res, 200, {
+    ok: true,
+    balance: Math.max(0, Math.floor(Number(a.user.balance) || 0)),
+    streak: streak,
+    transfer_unlocked: unlocked,
+    days_left: unlocked ? 0 : (POINTS_TRANSFER_MIN_STREAK_DAYS - streak),
   });
 }
 
