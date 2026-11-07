@@ -193,6 +193,36 @@ function broadcast(msg, exceptId) {
   }
 }
 
+// ---------- Presence: đếm người thật đang online (Thọ chốt 07/11) ----------
+// Bộ nhớ tạm trong RAM (không lưu file): sid -> {page, t}.
+// PHẢI đặt ở cấp module (ngoài createServer) để trạng thái sống qua các request.
+const PRESENCE_PAGES = ['mau', 'shop', 'kiot', 'hoidap'];
+const PRESENCE_TTL_MS = 90 * 1000;
+const presenceMap = new Map();
+function presenceCorsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': 'https://phatphaponline.pages.dev',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Vary': 'Origin',
+  };
+}
+function presenceJson(res, status, obj) {
+  const h = Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, presenceCorsHeaders());
+  res.writeHead(status, h);
+  res.end(JSON.stringify(obj));
+}
+function presenceCounts() {
+  const now = Date.now();
+  const out = { mau: 0, shop: 0, kiot: 0, hoidap: 0, total: 0 };
+  for (const [sid, v] of presenceMap) {
+    if (now - v.t > PRESENCE_TTL_MS) { presenceMap.delete(sid); continue; }
+    if (PRESENCE_PAGES.includes(v.page)) { out[v.page]++; out.total++; }
+  }
+  return out;
+}
+
 // ---------- HTTP: webhook nghi thức + xem bảng vàng ----------
 const server = http.createServer((req, res) => {
   // /auth/* — tài khoản + ví xu (xử lý CORS + cookie trong auth.js)
@@ -206,6 +236,37 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/merit') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(boardTop(10)));
+    return;
+  }
+  // ---------- Presence: đếm người thật đang online (Thọ chốt 07/11) ----------
+  // POST /presence {sid, page} — nhịp tim 30 giây/lần; {sid, bye:true} khi rời trang.
+  // GET /presence — số người thật theo mục trong cửa sổ 90 giây qua.
+  // Khách chỉ thấy số HIỂN THỊ (mốc ảo + tăng ảo + người thật); phần thật chỉ
+  // admin thấy ở tab "🟢 Trực tuyến" trong trang quản trị.
+  // (Trạng thái presenceMap + hàm phụ đặt ở cấp module, trên createServer.)
+  if (req.url === '/presence' || req.url.startsWith('/presence?')) {
+    if (req.method === 'OPTIONS') { presenceJson(res, 204, {}); return; }
+    if (req.method === 'GET') { presenceJson(res, 200, presenceCounts()); return; }
+    if (req.method === 'POST') {
+      // KHÔNG giới hạn theo IP ở đây: 1 người mở nhiều tab sẽ gửi nhiều nhịp
+      // tim cùng lúc (mỗi tab 30 giây/lần) — chặn theo IP sẽ làm thiếu số
+      // người thật. Chống lạm dụng bằng giới hạn 5000 phiên + hết hạn 90 giây.
+      readBody(req, (body) => {
+        let m; try { m = JSON.parse(body); } catch (e) { presenceJson(res, 400, { ok: false }); return; }
+        const sid = String(m.sid || '').slice(0, 64);
+        if (!sid) { presenceJson(res, 400, { ok: false }); return; }
+        if (m.bye) { presenceMap.delete(sid); }
+        else {
+          if (presenceMap.size > 5000) presenceCounts(); // dọn mục hết hạn trước khi nhận mới
+          if (presenceMap.size > 5000) { presenceJson(res, 200, { ok: true }); return; }
+          const pg = PRESENCE_PAGES.includes(m.page) ? m.page : 'mau';
+          presenceMap.set(sid, { page: pg, t: Date.now() });
+        }
+        presenceJson(res, 200, { ok: true });
+      });
+      return;
+    }
+    presenceJson(res, 405, { ok: false });
     return;
   }
   // POST /ritual — kích hoạt nghi thức từ bên ngoài
