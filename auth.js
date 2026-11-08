@@ -14,7 +14,7 @@ const mailer = require('./mailer');
 
 const WEB_ORIGIN = 'https://phatphaponline.pages.dev';
 const WEB_BASE = 'https://phatphaponline.pages.dev';
-const SESSION_DAYS = 30;
+const SESSION_DAYS = 90; // Phiên 90 ngày (Thọ 08/11 ~12:57: hạn chế tối đa việc phải đăng nhập lại — giữ online mọi công cụ). Kết hợp gia hạn trượt ở doMe: người dùng còn hoạt động thì không bao giờ bị out.
 const BCRYPT_COST = 8; // Bonto free: proxy timeout ~1.1s, baseline moi request ~0.8s (ha tang) -> bcrypt phai <0.3s. Cost 8 (~0.15s) vua du; se nang lai khi chuyen hosting tot hon. Khong dung thap hon 8.
 const RESET_TTL_MS = 60 * 60 * 1000; // 60 phút
 const LOCK_AFTER_FAILS = 5;
@@ -505,6 +505,22 @@ function doMe(req, res) {
     return json(res, 200, { logged_in: false });
   }
   const users = a.users;
+  // Gia hạn trượt (Thọ 08/11 ~12:57 — hạn chế tối đa việc bị out): phiên còn < 15 ngày
+  // thì +90 ngày nữa + cấp lại cookie. /auth/me được web gọi mỗi lần tải trang nên
+  // người dùng còn hoạt động sẽ không bao giờ hết phiên. Chỉ ghi đè khi cần gia hạn.
+  try {
+    const token = getSessionToken(req);
+    if (token) {
+      const sessions = store.loadSessions();
+      const key = store.sha256hex(token);
+      const s = sessions[key];
+      if (s && s.expires_at && s.expires_at - Date.now() < 15 * 24 * 3600 * 1000) {
+        s.expires_at = Date.now() + SESSION_DAYS * 24 * 3600 * 1000;
+        store.saveSessions(sessions);
+        setSessionCookie(res, token);
+      }
+    }
+  } catch (e) { /* gia hạn lỗi thì phiên cũ vẫn dùng được đến hạn cũ */ }
   recordActiveDay(a.user); // ghi ngày online hôm nay (Asia/Saigon)
   store.saveUsers(users); // lưu merit đã đồng bộ (nếu có)
   return json(res, 200, { logged_in: true, user: publicUser(a.user) });
