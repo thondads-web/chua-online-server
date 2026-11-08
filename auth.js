@@ -5,6 +5,8 @@
 // ============================================================
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const store = require('./authStore');
@@ -298,6 +300,7 @@ async function handleAuth(req, res) {
     if (route === '/points/transfer' && req.method === 'POST') return doPointsTransfer(req, res, body);
     if (route === '/points/status' && req.method === 'GET') return doPointsStatus(req, res);
     if (route === '/admin/stats' && req.method === 'GET') return doAdminStats(req, res);
+    if (route === '/admin/export' && req.method === 'GET') return doAdminExport(req, res);
     if (route === '/admin/users' && req.method === 'GET') return doAdminUsers(req, res);
     if (route === '/admin/user' && req.method === 'GET') return doAdminUserDetail(req, res);
     if (route === '/admin/user/lock' && req.method === 'POST') return doAdminUserLock(req, res, body);
@@ -1109,6 +1112,59 @@ function doAdminStats(req, res) {
     total_xu_circulation: xu,
     users: list,
   });
+}
+
+// ---------- GET /auth/admin/export — snapshot toàn bộ dữ liệu live (chỉ cho cron sao lưu) ----------
+// Thọ giao 08/11/2026: cron sao lưu 03:00 FAIL 3 ngày liền vì server chưa có endpoint export.
+// GET chỉ-đọc, bảo vệ bằng adminGuard (x-admin-token, như /auth/admin/stats).
+// Trả về TOÀN BỘ file trong data/ (users, sessions, comments, activity, ledger,
+// resets, admin-log, config, hidden-articles, review-queue, game-stats, merit...),
+// KỂ CẢ password_hash — vì đây là bản sao lưu để KHÔI PHỤC, thiếu hash thì tài
+// khoản khôi phục xong không đăng nhập lại được. Vì vậy output CHỈ được lưu trong
+// hidden_files/backups/, TUYỆT ĐỐI không đưa lên chat/báo cáo/log, không upload đi đâu.
+// Không ghi gì, không đổi hành vi endpoint nào khác.
+// Định dạng mỗi collection: { format: 'json'|'jsonl'|'empty'|'unparsable',
+//   count: số bản ghi, size: byte, data: nội dung đã parse (null nếu rỗng/lỗi) }.
+// - 'json': file JSON thường (object/array) — lưu lại bằng JSON.stringify(data).
+// - 'jsonl': mỗi dòng 1 JSON (comments.db) — lưu lại bằng data.map(JSON.stringify).join('\n').
+// - 'empty': file rỗng 0 byte — lưu lại file rỗng. 'unparsable': không đọc được — data null.
+function doAdminExport(req, res) {
+  if (!adminGuard(req, res)) return;
+  const out = { ok: true, exported_at: Date.now(), collections: {}, counts: {} };
+  let files = [];
+  try { files = fs.readdirSync(store.DATA_DIR); } catch (e) { files = []; }
+  files.sort();
+  for (const file of files) {
+    if (file.endsWith('.tmp')) continue; // file ghi tạm của writeJson — không phải dữ liệu
+    const full = path.join(store.DATA_DIR, file);
+    let st = null;
+    try { st = fs.statSync(full); } catch (e) { continue; }
+    if (!st.isFile()) continue;
+    let raw = '';
+    try { raw = fs.readFileSync(full, 'utf8'); } catch (e) { raw = ''; }
+    let data = null, format = 'empty', count = 0;
+    if (raw.trim() === '') {
+      format = 'empty'; data = null; count = 0;
+    } else {
+      try {
+        data = JSON.parse(raw);
+        format = 'json';
+        count = Array.isArray(data) ? data.length : Object.keys(data).length;
+      } catch (e) {
+        // Thử JSONL (comments.db: mỗi bình luận 1 dòng JSON).
+        const lines = [];
+        for (const line of raw.split('\n')) {
+          if (!line.trim()) continue;
+          try { const c = JSON.parse(line); lines.push(c); } catch (e2) {}
+        }
+        if (lines.length > 0) { data = lines; format = 'jsonl'; count = lines.length; }
+        else { data = null; format = 'unparsable'; count = 0; }
+      }
+    }
+    out.collections[file] = { format: format, count: count, size: st.size, data: data };
+    out.counts[file] = count;
+  }
+  return json(res, 200, out);
 }
 
 // ---------- Trang quản trị (admin.html) ----------
