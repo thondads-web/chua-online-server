@@ -613,7 +613,7 @@ async function doReset(req, res, body) {
 // ---------- GET /auth/wallet ----------
 function doWallet(req, res) {
   const a = getAuthUser(req);
-  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  if (!a) { logAct(req, null, null, 'wallet', 'fail', 'chua_dang_nhap', ''); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   return json(res, 200, {
     ok: true,
     balance: a.user.balance || 0,
@@ -624,7 +624,7 @@ function doWallet(req, res) {
 // ---------- GET /auth/character ----------
 function doCharacterGet(req, res) {
   const a = getAuthUser(req);
-  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  if (!a) { logAct(req, null, null, 'character', 'fail', 'chua_dang_nhap', ''); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   const users = a.users;
   store.saveUsers(users); // lưu merit đã đồng bộ (nếu có)
   const c = a.user.character;
@@ -642,7 +642,7 @@ function doCharacterGet(req, res) {
 //   chọn ảnh chưa mở khóa → 403.
 function doCharacterPatch(req, res, body) {
   const a = getAuthUser(req);
-  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  if (!a) { logAct(req, null, null, 'character', 'fail', 'chua_dang_nhap', ''); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   const users = a.users;
   const user = a.user;
   const c = user.character;
@@ -1042,7 +1042,7 @@ function doPointsTransfer(req, res, body) {
 // GET /auth/points/status — số dư + chuỗi online + trạng thái mở chuyển.
 function doPointsStatus(req, res) {
   const a = getAuthUser(req);
-  if (!a) return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.');
+  if (!a) { logAct(req, null, null, 'points/status', 'fail', 'chua_dang_nhap', ''); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   const streak = activeStreak(a.user);
   const unlocked = streak >= POINTS_TRANSFER_MIN_STREAK_DAYS;
   return json(res, 200, {
