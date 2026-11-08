@@ -819,6 +819,10 @@ const server = http.createServer((req, res) => {
             if (typeof m.review_mode !== 'boolean') return adminErr(res, 400, 'du_lieu_khong_hop_le', 'review_mode phải là true/false.');
             next.review_mode = m.review_mode;
           }
+          if (m.points_spending_enabled !== undefined) {
+            if (typeof m.points_spending_enabled !== 'boolean') return adminErr(res, 400, 'du_lieu_khong_hop_le', 'points_spending_enabled phải là true/false.');
+            next.points_spending_enabled = m.points_spending_enabled;
+          }
           if (m.max_players !== undefined) {
             const v = Math.floor(Number(m.max_players));
             if (!Number.isFinite(v) || v < 10 || v > 1000) return adminErr(res, 400, 'du_lieu_khong_hop_le', 'Số người tối đa từ 10 đến 1000.');

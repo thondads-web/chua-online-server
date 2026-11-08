@@ -34,6 +34,15 @@ const POINTS_TRANSFER_MIN_STREAK_DAYS = 30; // chuyển điểm cần online li�
 const POINTS_ACTIVE_DAYS_KEEP = 45; // giữ tối đa 45 ngày online gần nhất trên user.active_days
 const PARTNER_DEFAULT_BALANCE = 1000; // tài khoản đối tác (admin tạo) có số dư mặc định 1000 điểm
 
+// TẠM KHOÁ THU ĐIỂM (Thọ lệnh 08/11/2026 ~11:33): khi cờ TẮT, dùng dịch vụ /
+// xem chuyên sâu miễn phí — không trừ điểm, không cần đăng nhập. Cờ nằm trong
+// config (points_spending_enabled, mặc định false; bật lại qua POST /admin/config
+// hoặc sửa config.db — không cần deploy lại code). Các cộng điểm KHÔNG đổi:
+// /auth/earn, /auth/points/earn, đăng ký +100, hồ sơ +30, chuyển điểm + streak.
+function spendingEnabled() {
+  try { return store.loadConfig().points_spending_enabled !== false; } catch (e) { return true; }
+}
+
 // ---------- Đối tác + Vi phạm (Thọ chốt 07/11/2026) ----------
 // Đối tác: dùng điểm NHƯ tài khoản thường (−20/−50), KHÔNG chuyển điểm
 // (không gửi, không nhận), vẫn +10 công đức, vẫn chịu vi phạm.
@@ -806,6 +815,8 @@ function pointsEarnedToday(userId, kind) {
 
 // POST /auth/points/use {service} — trừ 20 điểm để dùng 1 dịch vụ.
 function doPointsUse(req, res, body) {
+  // Tạm khoá thu điểm: miễn phí, không trừ, không cần đăng nhập.
+  if (!spendingEnabled()) return json(res, 200, { ok: true, charged: 0, free: true });
   const a = getAuthUser(req);
   if (!a) { logAct(req, null, null, 'points/use', 'fail', 'chua_dang_nhap', 'Dịch vụ: ' + String(body.service || '')); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   const service = String(body.service || '').trim().slice(0, 50);
@@ -841,6 +852,8 @@ function doPointsUse(req, res, body) {
 
 // POST /auth/points/view {article} — trừ 50 điểm để xem 1 bài chuyên sâu.
 function doPointsView(req, res, body) {
+  // Tạm khoá thu điểm: miễn phí, không trừ, không cần đăng nhập.
+  if (!spendingEnabled()) return json(res, 200, { ok: true, charged: 0, free: true });
   const a = getAuthUser(req);
   if (!a) { logAct(req, null, null, 'points/view', 'fail', 'chua_dang_nhap', 'Bài: ' + String(body.article || '')); return err(res, 401, 'chua_dang_nhap', 'Thí chủ chưa đăng nhập.'); }
   const article = String(body.article || '').trim().slice(0, 50);
@@ -1039,6 +1052,7 @@ function doPointsStatus(req, res) {
     streak: streak,
     transfer_unlocked: unlocked,
     days_left: unlocked ? 0 : (POINTS_TRANSFER_MIN_STREAK_DAYS - streak),
+    spending_enabled: spendingEnabled(),
   });
 }
 

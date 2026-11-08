@@ -269,6 +269,10 @@ function recentActivity(limit, filter) {
 const DEFAULT_CONFIG = {
   game_enabled: true,
   review_mode: false,
+  // TẠM KHOÁ THU ĐIỂM (Thọ lệnh 08/11/2026 ~11:33): false = dùng dịch vụ /
+  // xem chuyên sâu miễn phí (không trừ điểm, không cần đăng nhập). Mở lại:
+  // đặt true qua POST /admin/config — không cần deploy lại code.
+  points_spending_enabled: false,
   max_players: 200,
   merit_points: {
     incense: 15, prostrate: 15, bell: 10, lantern: 10, wishcard: 10,
@@ -287,6 +291,7 @@ function loadConfig() {
   if (raw && typeof raw === 'object') {
     if (typeof raw.game_enabled === 'boolean') cfg.game_enabled = raw.game_enabled;
     if (typeof raw.review_mode === 'boolean') cfg.review_mode = raw.review_mode;
+    if (typeof raw.points_spending_enabled === 'boolean') cfg.points_spending_enabled = raw.points_spending_enabled;
     if (Number.isFinite(raw.max_players)) cfg.max_players = Math.max(10, Math.min(1000, Math.floor(raw.max_players)));
     if (raw.merit_points && typeof raw.merit_points === 'object') {
       for (const k of Object.keys(cfg.merit_points)) {
